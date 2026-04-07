@@ -5,7 +5,7 @@ import sqlite3
 import plotly.express as px
 import io
 
-DB_NAME = "/content/drive/MyDrive/restaurant_data_v2.sqlite"
+DB_NAME = "restaurant_data.sqlite"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
