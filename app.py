@@ -50,85 +50,68 @@ def process_lightspeed(df, version="K-Series"):
     df['time_of_day'] = df['order_timestamp'].dt.hour.apply(get_time_of_day)
     df['source'] = f'Lightspeed {version}'
 
-    # --- BASIC TOTALS ---
-    df['gross_total'] = pd.to_numeric(df['Total'], errors='coerce').fillna(0)
-    df['net_total'] = pd.to_numeric(df['Net Total'], errors='coerce').fillna(0)
-    df['tax_total'] = df['gross_total'] - df['net_total']
-
     rows = []
 
     for _, r in df.iterrows():
-        vat_raw = str(r.get('VAT %', '')).strip()
-        tax_raw = str(r.get('VAT', '')).strip()
+        vat_string = str(r.get('VAT', '')).strip()
 
-        # CASE 1: multiple VAT rates present
-        if ',' in vat_raw and ',' in tax_raw:
-            vat_rates = vat_raw.split(',')
-            vat_amounts = tax_raw.split(',')
+        # Example: "12.0%=5.46 | 21.0%=1.82"
+        if '=' in vat_string:
+            parts = vat_string.split('|')
 
-            if len(vat_rates) == len(vat_amounts):
-                for rate_str, tax_str in zip(vat_rates, vat_amounts):
-                    try:
-                        rate = float(rate_str.replace('%','').strip())
-                        tax = float(tax_str)
+            for part in parts:
+                try:
+                    rate_part, tax_part = part.split('=')
+                    rate = float(rate_part.replace('%','').strip())
+                    tax = float(tax_part.strip())
 
-                        net = round(tax / (rate / 100), 2) if rate != 0 else 0
-                        gross = round(net + tax, 2)
+                    net = round(tax / (rate / 100), 2) if rate != 0 else 0
+                    gross = round(net + tax, 2)
 
-                        new_row = {
-                            'order_id': r['order_id'],
-                            'source': r['source'],
-                            'channel': r['channel'],
-                            'order_timestamp': r['order_timestamp'],
-                            'time_of_day': r['time_of_day'],
-                            'vat_rate': f"{int(rate)}%",
-                            'net_sales': net,
-                            'tax': tax,
-                            'gross_sales': gross
-                        }
-                        rows.append(new_row)
-                    except:
-                        continue
-            else:
-                # fallback if mismatch
-                rows.append({
-                    'order_id': r['order_id'],
-                    'source': r['source'],
-                    'channel': r['channel'],
-                    'order_timestamp': r['order_timestamp'],
-                    'time_of_day': r['time_of_day'],
-                    'vat_rate': 'Mixed',
-                    'net_sales': r['net_total'],
-                    'tax': r['tax_total'],
-                    'gross_sales': r['gross_total']
-                })
+                    rows.append({
+                        'order_id': r['order_id'],
+                        'source': r['source'],
+                        'channel': r['channel'],
+                        'order_timestamp': r['order_timestamp'],
+                        'time_of_day': r['time_of_day'],
+                        'vat_rate': f"{int(rate)}%",
+                        'net_sales': net,
+                        'tax': tax,
+                        'gross_sales': gross
+                    })
 
-        # CASE 2: single VAT
+                except Exception:
+                    continue
+
         else:
-            rate = vat_raw.replace('%','').strip()
+            # fallback if format unexpected
+            gross = pd.to_numeric(r.get('Total', 0), errors='coerce')
+            net = pd.to_numeric(r.get('Net Total', 0), errors='coerce')
+            tax = gross - net
+
             rows.append({
                 'order_id': r['order_id'],
                 'source': r['source'],
                 'channel': r['channel'],
                 'order_timestamp': r['order_timestamp'],
                 'time_of_day': r['time_of_day'],
-                'vat_rate': f"{rate}%" if rate else 'Unknown',
-                'net_sales': r['net_total'],
-                'tax': r['tax_total'],
-                'gross_sales': r['gross_total']
+                'vat_rate': 'Unknown',
+                'net_sales': net,
+                'tax': tax,
+                'gross_sales': gross
             })
 
     clean_df = pd.DataFrame(rows)
 
-    # 🔍 sanity check (VERY IMPORTANT)
+    # ✅ sanity check
     if not clean_df.empty:
-        orig = df['gross_total'].sum()
-        new = clean_df['gross_sales'].sum()
-        if abs(orig - new) > 1:
-            print(f"⚠️ WARNING: totals mismatch {orig} vs {new}")
+        original_total = pd.to_numeric(df['Total'], errors='coerce').sum()
+        new_total = clean_df['gross_sales'].sum()
+
+        if abs(original_total - new_total) > 1:
+            print(f"⚠️ WARNING mismatch: {original_total} vs {new_total}")
 
     return clean_df
-
 def process_ubereats(df):
     df = df[df['Order status'] == 'Completed'].copy()
     df['order_id'] = 'UE_' + df['Order ID'].astype(str)
