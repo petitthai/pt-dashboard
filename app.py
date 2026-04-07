@@ -116,19 +116,44 @@ def process_ubereats(df):
     return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']]
 
 def process_deliveroo(df):
-    df = df[df['Order status'] == 'Completed'].copy()
+    df.columns = df.columns.str.strip()
+
+    # Handle case where CSV was still malformed
+    if len(df.columns) == 1:
+        df = df[df.columns[0]].str.split(",", expand=True)
+        df.columns = [
+            'Restaurant name','Order number','Order status',
+            'Date submitted','Time submitted',
+            'Date delivered','Time delivered',
+            'Subtotal','Deliveroo commission','VAT on Deliveroo commission'
+        ]
+
+    # Filter completed orders safely
+    if 'Order status' in df.columns:
+        df = df[df['Order status'] == 'Completed'].copy()
+    else:
+        st.error("❌ Deliveroo file format not recognized")
+        return pd.DataFrame()
+
     df['order_id'] = 'DL_' + df['Order number'].astype(str)
     df['channel'] = 'Delivery'
     df['source'] = 'Deliveroo'
-    if 'Time submitted' in df.columns:
-        df['order_timestamp'] = pd.to_datetime(df['Date submitted'] + ' ' + df['Time submitted'], dayfirst=True)
-    else:
-        df['order_timestamp'] = pd.to_datetime(df['Date submitted'], dayfirst=True)
+
+    df['order_timestamp'] = pd.to_datetime(
+        df['Date submitted'] + ' ' + df['Time submitted'],
+        errors='coerce',
+        dayfirst=True
+    )
+
     df['time_of_day'] = df['order_timestamp'].dt.hour.apply(get_time_of_day)
+
     df['gross_sales'] = pd.to_numeric(df['Subtotal'], errors='coerce').fillna(0)
+
+    # Belgium assumption: 6% VAT for food delivery
     df['net_sales'] = (df['gross_sales'] / 1.06).round(2)
     df['tax'] = df['gross_sales'] - df['net_sales']
     df['vat_rate'] = '6%'
+
     return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']]
 
 def process_takeaway(df):
@@ -201,7 +226,14 @@ if not data.empty:
 if st.sidebar.button("Process File"):
     if uploaded_file:
         raw = uploaded_file.read()
-        df_raw = pd.read_csv(io.BytesIO(raw), sep=';')
+
+        # Try both separators automatically
+        try:
+            df_raw = pd.read_csv(io.BytesIO(raw), sep=';')
+            if len(df_raw.columns) == 1:
+                df_raw = pd.read_csv(io.BytesIO(raw), sep=',')
+        except:
+            df_raw = pd.read_csv(io.BytesIO(raw), sep=',')
 
         parsers = {
             "Lightspeed K-Series": lambda d: process_lightspeed(d, "K-Series"),
