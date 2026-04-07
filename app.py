@@ -4,18 +4,18 @@ from sqlalchemy import create_engine, text
 import plotly.express as px
 import io
 
-# Securely connect to Supabase
+# --- DB CONNECTION ---
 DB_URL = st.secrets["SUPABASE_URL"]
+
 engine = create_engine(
     DB_URL,
     connect_args={"sslmode": "require"},
     pool_pre_ping=True
 )
 
-import traceback
-        
+# --- INIT DB ---
 def init_db():
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         conn.execute(text('''
             CREATE TABLE IF NOT EXISTS sales (
                 id SERIAL PRIMARY KEY,
@@ -31,12 +31,13 @@ def init_db():
                 UNIQUE(order_id, vat_rate)
             )
         '''))
-        conn.commit()
 
+# --- HELPERS ---
 def get_time_of_day(hour):
     if pd.isna(hour): return 'Unknown'
     return 'Lunch' if hour < 16 else 'Dinner'
 
+# --- LIGHTSPEED PROCESSOR (FIXED VAT SPLIT) ---
 def process_lightspeed(df, version="K-Series"):
     if 'Status' in df.columns:
         df = df[df['Status'].isin(['Paid', 'Done'])].copy()
@@ -45,7 +46,10 @@ def process_lightspeed(df, version="K-Series"):
     date_col = 'Creation Date' if 'Creation Date' in df.columns else 'Date'
 
     df['order_id'] = f'LS_{version}_' + df[receipt_col].astype(str)
-    df['channel'] = df['Type'].apply(lambda x: 'Takeaway' if str(x).lower() == 'takeaway' else 'In-Restaurant') if 'Type' in df.columns else 'In-Restaurant'
+    df['channel'] = df['Type'].apply(
+        lambda x: 'Takeaway' if str(x).lower() == 'takeaway' else 'In-Restaurant'
+    ) if 'Type' in df.columns else 'In-Restaurant'
+
     df['order_timestamp'] = pd.to_datetime(df[date_col], dayfirst=True)
     df['time_of_day'] = df['order_timestamp'].dt.hour.apply(get_time_of_day)
     df['source'] = f'Lightspeed {version}'
@@ -55,37 +59,34 @@ def process_lightspeed(df, version="K-Series"):
     for _, r in df.iterrows():
         vat_string = str(r.get('Taxes', '')).strip()
 
-if '=' in vat_string:
-    parts = [p.strip() for p in vat_string.split('|')]
+        if '=' in vat_string:
+            parts = [p.strip() for p in vat_string.split('|')]
 
-    for part in parts:
-        try:
-            rate_part, tax_part = part.split('=')
+            for part in parts:
+                try:
+                    rate_part, tax_part = part.split('=')
 
-            rate = float(rate_part.replace('%','').strip())
-            tax = float(tax_part.strip())
+                    rate = float(rate_part.replace('%','').strip())
+                    tax = float(tax_part.strip())
 
-            net = round(tax / (rate / 100), 2) if rate != 0 else 0
-            gross = round(net + tax, 2)
+                    net = round(tax / (rate / 100), 2) if rate != 0 else 0
+                    gross = round(net + tax, 2)
 
-            rows.append({
-                'order_id': r['order_id'],
-                'source': r['source'],
-                'channel': r['channel'],
-                'order_timestamp': r['order_timestamp'],
-                'time_of_day': r['time_of_day'],
-                'vat_rate': f"{int(rate)}%",
-                'net_sales': net,
-                'tax': tax,
-                'gross_sales': gross
-            })
+                    rows.append({
+                        'order_id': r['order_id'],
+                        'source': r['source'],
+                        'channel': r['channel'],
+                        'order_timestamp': r['order_timestamp'],
+                        'time_of_day': r['time_of_day'],
+                        'vat_rate': f"{int(rate)}%",
+                        'net_sales': net,
+                        'tax': tax,
+                        'gross_sales': gross
+                    })
 
-        except Exception as e:
-            print("Parse error:", part, e)
+                except Exception:
                     continue
-
         else:
-            # fallback if format unexpected
             gross = pd.to_numeric(r.get('Total', 0), errors='coerce')
             net = pd.to_numeric(r.get('Net Total', 0), errors='coerce')
             tax = gross - net
@@ -96,7 +97,7 @@ if '=' in vat_string:
                 'channel': r['channel'],
                 'order_timestamp': r['order_timestamp'],
                 'time_of_day': r['time_of_day'],
-                'vat_rate': 'Unknown',
+                'vat_rate': 'Mixed',
                 'net_sales': net,
                 'tax': tax,
                 'gross_sales': gross
@@ -104,15 +105,17 @@ if '=' in vat_string:
 
     clean_df = pd.DataFrame(rows)
 
-    # ✅ sanity check
+    # sanity check
     if not clean_df.empty:
-        original_total = pd.to_numeric(df['Total'], errors='coerce').sum()
-        new_total = clean_df['gross_sales'].sum()
+        orig = pd.to_numeric(df['Total'], errors='coerce').sum()
+        new = clean_df['gross_sales'].sum()
 
-        if abs(original_total - new_total) > 1:
-            print(f"⚠️ WARNING mismatch: {original_total} vs {new_total}")
+        if abs(orig - new) > 1:
+            print(f"⚠️ WARNING totals mismatch {orig} vs {new}")
 
     return clean_df
+
+# --- OTHER SOURCES ---
 def process_ubereats(df):
     df = df[df['Order status'] == 'Completed'].copy()
     df['order_id'] = 'UE_' + df['Order ID'].astype(str)
@@ -120,10 +123,12 @@ def process_ubereats(df):
     df['source'] = 'Uber Eats'
     df['order_timestamp'] = pd.to_datetime(df['Order date'] + ' ' + df['Order confirmed time'], dayfirst=True)
     df['time_of_day'] = df['order_timestamp'].dt.hour.apply(get_time_of_day)
+
     df['gross_sales'] = pd.to_numeric(df['Sales (incl. VAT)'], errors='coerce').fillna(0)
     df['net_sales'] = pd.to_numeric(df['Sales (excl. VAT)'], errors='coerce').fillna(0)
     df['tax'] = df['gross_sales'] - df['net_sales']
     df['vat_rate'] = '6%'
+
     return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']]
 
 def process_deliveroo(df):
@@ -131,39 +136,44 @@ def process_deliveroo(df):
     df['order_id'] = 'DL_' + df['Order number'].astype(str)
     df['channel'] = 'Delivery'
     df['source'] = 'Deliveroo'
+
     if 'Time submitted' in df.columns:
         df['order_timestamp'] = pd.to_datetime(df['Date submitted'] + ' ' + df['Time submitted'], dayfirst=True)
     else:
         df['order_timestamp'] = pd.to_datetime(df['Date submitted'], dayfirst=True)
+
     df['time_of_day'] = df['order_timestamp'].dt.hour.apply(get_time_of_day)
     df['gross_sales'] = pd.to_numeric(df['Subtotal'], errors='coerce').fillna(0)
     df['net_sales'] = (df['gross_sales'] / 1.06).round(2)
     df['tax'] = df['gross_sales'] - df['net_sales']
     df['vat_rate'] = '6%'
+
     return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']]
 
 def process_takeaway(df):
-    df = df.copy()
     df['order_id'] = 'TA_' + df['Order'].astype(str)
     df['channel'] = 'Delivery'
     df['source'] = 'Takeaway'
     df['order_timestamp'] = pd.to_datetime(df['Date'], dayfirst=True)
     df['time_of_day'] = df['order_timestamp'].dt.hour.apply(get_time_of_day)
+
     df['gross_sales'] = pd.to_numeric(df['Total amount'], errors='coerce').fillna(0)
     df['net_sales'] = (df['gross_sales'] / 1.06).round(2)
     df['tax'] = df['gross_sales'] - df['net_sales']
     df['vat_rate'] = '6%'
+
     return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']]
 
+# --- SAVE ---
 def save_to_db(clean_df):
     if clean_df.empty:
-        return 0, 0, 0
+        return 0, 0
 
     total_rows = len(clean_df)
     unique_orders = clean_df['order_id'].nunique()
 
     with engine.begin() as conn:
-        result = conn.execute(text("""
+        conn.execute(text("""
             INSERT INTO sales (order_id, source, channel, order_timestamp, time_of_day, vat_rate, net_sales, tax, gross_sales)
             VALUES (:order_id, :source, :channel, :order_timestamp, :time_of_day, :vat_rate, :net_sales, :tax, :gross_sales)
             ON CONFLICT (order_id, vat_rate) DO NOTHING
@@ -171,16 +181,20 @@ def save_to_db(clean_df):
 
     return total_rows, unique_orders
 
+# --- LOAD ---
 @st.cache_data(ttl=60)
 def load_data():
     df = pd.read_sql("SELECT * FROM sales", engine)
-    if not df.empty:
-        df['order_timestamp'] = pd.to_datetime(df['order_timestamp'])
-        df['order_date'] = df['order_timestamp'].dt.date
-        df['year'] = df['order_timestamp'].dt.year
-        df['month'] = df['order_timestamp'].dt.to_period('M').astype(str)
-        df['week_str'] = df['order_timestamp'].dt.strftime('%G-W%V') 
-        df['quarter'] = df['order_timestamp'].dt.to_period('Q').astype(str)
+    if df.empty:
+        return df
+
+    df['order_timestamp'] = pd.to_datetime(df['order_timestamp'])
+    df['order_date'] = df['order_timestamp'].dt.date
+    df['year'] = df['order_timestamp'].dt.year
+    df['month'] = df['order_timestamp'].dt.to_period('M').astype(str)
+    df['week_str'] = df['order_timestamp'].dt.strftime('%G-W%V')
+    df['quarter'] = df['order_timestamp'].dt.to_period('Q').astype(str)
+
     return df
 
 # --- APP ---
@@ -189,119 +203,53 @@ init_db()
 
 st.sidebar.title("Data Sync")
 
-with st.sidebar.expander("How to update", expanded=True):
-    st.markdown("""
-- **K-Series:** Backoffice → Reports → Receipts → Export CSV  
-- **Uber Eats:** UE Manager → Payments → Invoices → Export CSV  
-- **Deliveroo:** Hub → Invoices → Orders → Export CSV  
-- **Takeaway:** Portal → Invoicing → Orders → Export CSV
-    """)
+source_option = st.sidebar.selectbox("Source", [
+    "Lightspeed K-Series","Lightspeed L-Series","Deliveroo","Uber Eats","Takeaway"
+])
 
-source_option = st.sidebar.selectbox("Source", ["Lightspeed K-Series","Lightspeed L-Series","Deliveroo","Uber Eats","Takeaway"])
 uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+
+data = load_data()
+
+# Show data range
+if not data.empty:
+    src_data = data[data['source'] == source_option]
+    if not src_data.empty:
+        st.sidebar.info(f"Data in DB: {src_data['order_timestamp'].min().date()} → {src_data['order_timestamp'].max().date()}")
 
 if st.sidebar.button("Process File"):
     if uploaded_file:
-        try:
-            raw = uploaded_file.read()
-            try:
-                df_raw = pd.read_csv(io.BytesIO(raw), sep=';')
-                if len(df_raw.columns) < 3:
-                    df_raw = pd.read_csv(io.BytesIO(raw), sep=',')
-            except Exception:
-                df_raw = pd.read_csv(io.BytesIO(raw), sep=',')
+        raw = uploaded_file.read()
+        df_raw = pd.read_csv(io.BytesIO(raw), sep=';')
 
-            parsers = {
-                "Lightspeed K-Series": lambda d: process_lightspeed(d, "K-Series"),
-                "Lightspeed L-Series": lambda d: process_lightspeed(d, "L-Series"),
-                "Uber Eats": process_ubereats,
-                "Deliveroo": process_deliveroo,
-                "Takeaway": process_takeaway,
-            }
-            clean_df = parsers[source_option](df_raw)
-            rows, orders = save_to_db(clean_df)
-            
-            st.sidebar.success(f"""
-            ✅ Import completed  
-            • {orders} orders added  
-            • {rows} VAT lines processed
-            """)
-            st.cache_data.clear()
-        except Exception as e:
-            st.sidebar.error(f"Error processing file: {e}")
-    else:
-        st.sidebar.warning("Upload a file first.")
+        parsers = {
+            "Lightspeed K-Series": lambda d: process_lightspeed(d, "K-Series"),
+            "Lightspeed L-Series": lambda d: process_lightspeed(d, "L-Series"),
+            "Uber Eats": process_ubereats,
+            "Deliveroo": process_deliveroo,
+            "Takeaway": process_takeaway,
+        }
 
-tab_dash, tab_vat = st.tabs(["Management Dashboard", "VAT Report"])
-data = load_data()
+        clean_df = parsers[source_option](df_raw)
 
-with tab_dash:
-    st.header("Management Dashboard")
-    if data.empty:
-        st.info("No data yet — upload a CSV from the sidebar.")
-    else:
-        total = data['gross_sales'].sum()
-        days = data['order_date'].nunique() or 1
-        lunch = data[data['time_of_day']=='Lunch']['gross_sales'].sum()
-        dinner = data[data['time_of_day']=='Dinner']['gross_sales'].sum()
+        rows, orders = save_to_db(clean_df)
 
-        c1,c2,c3,c4 = st.columns(4)
-        c1.metric("Total revenue", f"€{total:,.2f}")
-        c2.metric("Avg per open day", f"€{total/days:,.2f}")
-        c3.metric("Lunch", f"€{lunch:,.2f}", f"{lunch/total*100:.1f}%" if total else "")
-        c4.metric("Dinner", f"€{dinner:,.2f}", f"{dinner/total*100:.1f}%" if total else "")
+        st.sidebar.success(f"""
+        ✅ Import completed  
+        • {orders} orders  
+        • {rows} VAT lines
+        """)
 
-        st.divider()
-        col1, col2 = st.columns(2)
+        st.cache_data.clear()
 
-        with col1:
-            view = st.radio("Trend view", ["Weekly","Monthly"], horizontal=True)
-            grp_col = 'week_str' if view == 'Weekly' else 'month'
-            trend = data.groupby([grp_col,'year'])['gross_sales'].sum().reset_index()
-            fig = px.bar(trend, x=grp_col, y='gross_sales', color='year',
-                         barmode='group', labels={'gross_sales':'Gross (€)', grp_col:''})
-            fig.update_layout(legend_title_text='Year')
-            st.plotly_chart(fig, use_container_width=True)
+# --- DASHBOARD ---
+tab1, tab2 = st.tabs(["Dashboard", "VAT Report"])
 
-        with col2:
-            by_channel = data.groupby('channel')['gross_sales'].sum().reset_index()
-            fig2 = px.pie(by_channel, values='gross_sales', names='channel', hole=0.4)
-            st.plotly_chart(fig2, use_container_width=True)
+with tab1:
+    if not data.empty:
+        st.metric("Revenue", f"€{data['gross_sales'].sum():,.2f}")
 
-        by_src = data.groupby(['source','time_of_day'])['gross_sales'].sum().reset_index()
-        fig3 = px.bar(by_src, x='source', y='gross_sales', color='time_of_day',
-                      labels={'gross_sales':'Gross (€)','source':'','time_of_day':'Period'})
-        st.plotly_chart(fig3, use_container_width=True)
-
-        st.subheader("Avg gross per open day — channel × period")
-        pivot = data.groupby(['source','time_of_day'])['gross_sales'].sum().unstack(fill_value=0)
-        pivot = (pivot / days).round(2)
-        pivot['Total'] = pivot.sum(axis=1)
-        st.dataframe(pivot.style.format("€{:.2f}"), use_container_width=True)
-
-with tab_vat:
-    st.header("VAT Report")
-    if data.empty:
-        st.info("No data yet.")
-    else:
-        quarters = sorted(data['quarter'].unique(), reverse=True)
-        selected_q = st.selectbox("Quarter", quarters)
-        q_data = data[data['quarter'] == selected_q]
-
-        st.subheader("Summary by source and VAT rate")
-        summary = q_data.groupby(['source','vat_rate'])[['net_sales','tax','gross_sales']].sum().reset_index()
-        summary.columns = ['Source','VAT rate','Net','VAT','Gross']
-        st.dataframe(summary.style.format({"Net":"€{:.2f}","VAT":"€{:.2f}","Gross":"€{:.2f}"}), use_container_width=True)
-
-        totals = summary[['Net','VAT','Gross']].sum()
-        st.markdown(f"**Quarter total — Net: €{totals['Net']:,.2f} | VAT: €{totals['VAT']:,.2f} | Gross: €{totals['Gross']:,.2f}**")
-
-        if st.button("Export to Excel"):
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                summary.to_excel(writer, sheet_name='Summary', index=False)
-                q_data[['order_id','source','channel','order_timestamp','time_of_day',
-                         'vat_rate','net_sales','tax','gross_sales']].to_excel(writer, sheet_name='Transactions', index=False)
-            st.download_button("Download Excel", output.getvalue(),
-                file_name=f"VAT_{selected_q}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+with tab2:
+    if not data.empty:
+        summary = data.groupby(['source','vat_rate'])[['net_sales','tax','gross_sales']].sum().reset_index()
+        st.dataframe(summary)
