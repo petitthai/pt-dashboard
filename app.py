@@ -155,20 +155,20 @@ def process_takeaway(df):
     return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']]
 
 def save_to_db(clean_df):
-    inserted, duplicates = 0, 0
-    with engine.connect() as conn:
-        for _, row in clean_df.iterrows():
-            try:
-                conn.execute(text('''
-                    INSERT INTO sales (order_id, source, channel, order_timestamp, time_of_day, vat_rate, net_sales, tax, gross_sales)
-                    VALUES (:order_id, :source, :channel, :order_timestamp, :time_of_day, :vat_rate, :net_sales, :tax, :gross_sales)
-                '''), row.to_dict())
-                conn.commit()
-                inserted += 1
-            except Exception:
-                conn.rollback() # Postgres requires a rollback after a duplicate error
-                duplicates += 1
-    return inserted, duplicates
+    if clean_df.empty:
+        return 0, 0, 0
+
+    total_rows = len(clean_df)
+    unique_orders = clean_df['order_id'].nunique()
+
+    with engine.begin() as conn:
+        result = conn.execute(text("""
+            INSERT INTO sales (order_id, source, channel, order_timestamp, time_of_day, vat_rate, net_sales, tax, gross_sales)
+            VALUES (:order_id, :source, :channel, :order_timestamp, :time_of_day, :vat_rate, :net_sales, :tax, :gross_sales)
+            ON CONFLICT (order_id, vat_rate) DO NOTHING
+        """), clean_df.to_dict(orient="records"))
+
+    return total_rows, unique_orders
 
 @st.cache_data(ttl=60)
 def load_data():
@@ -218,8 +218,13 @@ if st.sidebar.button("Process File"):
                 "Takeaway": process_takeaway,
             }
             clean_df = parsers[source_option](df_raw)
-            ins, dups = save_to_db(clean_df)
-            st.sidebar.success(f"{ins} rows added, {dups} duplicates skipped.")
+            rows, orders = save_to_db(clean_df)
+            
+            st.sidebar.success(f"""
+            ✅ Import completed  
+            • {orders} orders added  
+            • {rows} VAT lines processed
+            """)
             st.cache_data.clear()
         except Exception as e:
             st.sidebar.error(f"Error processing file: {e}")
