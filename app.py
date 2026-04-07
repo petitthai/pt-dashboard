@@ -1,30 +1,31 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
+from sqlalchemy import create_engine, text
 import plotly.express as px
 import io
 
-DB_NAME = "restaurant_data.sqlite"
+# Securely connect to Supabase
+DB_URL = st.secrets["SUPABASE_URL"]
+engine = create_engine(DB_URL)
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS sales (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id TEXT,
-            source TEXT,
-            channel TEXT,
-            order_timestamp DATETIME,
-            time_of_day TEXT,
-            vat_rate TEXT,
-            net_sales REAL,
-            tax REAL,
-            gross_sales REAL,
-            UNIQUE(order_id, vat_rate)
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    with engine.connect() as conn:
+        conn.execute(text('''
+            CREATE TABLE IF NOT EXISTS sales (
+                id SERIAL PRIMARY KEY,
+                order_id TEXT,
+                source TEXT,
+                channel TEXT,
+                order_timestamp TIMESTAMP,
+                time_of_day TEXT,
+                vat_rate TEXT,
+                net_sales DOUBLE PRECISION,
+                tax DOUBLE PRECISION,
+                gross_sales DOUBLE PRECISION,
+                UNIQUE(order_id, vat_rate)
+            )
+        '''))
+        conn.commit()
 
 def get_time_of_day(hour):
     if pd.isna(hour): return 'Unknown'
@@ -89,30 +90,30 @@ def process_takeaway(df):
     return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']]
 
 def save_to_db(clean_df):
-    conn = sqlite3.connect(DB_NAME)
     inserted, duplicates = 0, 0
-    for _, row in clean_df.iterrows():
-        try:
-            conn.execute('''INSERT INTO sales (order_id,source,channel,order_timestamp,time_of_day,vat_rate,net_sales,tax,gross_sales)
-                VALUES (?,?,?,?,?,?,?,?,?)''', tuple(row))
-            inserted += 1
-        except sqlite3.IntegrityError:
-            duplicates += 1
-    conn.commit()
-    conn.close()
+    with engine.connect() as conn:
+        for _, row in clean_df.iterrows():
+            try:
+                conn.execute(text('''
+                    INSERT INTO sales (order_id, source, channel, order_timestamp, time_of_day, vat_rate, net_sales, tax, gross_sales)
+                    VALUES (:order_id, :source, :channel, :order_timestamp, :time_of_day, :vat_rate, :net_sales, :tax, :gross_sales)
+                '''), row.to_dict())
+                conn.commit()
+                inserted += 1
+            except Exception:
+                conn.rollback() # Postgres requires a rollback after a duplicate error
+                duplicates += 1
     return inserted, duplicates
 
 @st.cache_data(ttl=60)
 def load_data():
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql("SELECT * FROM sales", conn)
-    conn.close()
+    df = pd.read_sql("SELECT * FROM sales", engine)
     if not df.empty:
         df['order_timestamp'] = pd.to_datetime(df['order_timestamp'])
         df['order_date'] = df['order_timestamp'].dt.date
         df['year'] = df['order_timestamp'].dt.year
         df['month'] = df['order_timestamp'].dt.to_period('M').astype(str)
-        df['week_str'] = df['order_timestamp'].dt.strftime('%G-W%V')  # ISO week fix
+        df['week_str'] = df['order_timestamp'].dt.strftime('%G-W%V') 
         df['quarter'] = df['order_timestamp'].dt.to_period('Q').astype(str)
     return df
 
@@ -156,7 +157,7 @@ if st.sidebar.button("Process File"):
             st.sidebar.success(f"{ins} rows added, {dups} duplicates skipped.")
             st.cache_data.clear()
         except Exception as e:
-            st.sidebar.error(f"Error: {e}")
+            st.sidebar.error(f"Error processing file: {e}")
     else:
         st.sidebar.warning("Upload a file first.")
 
