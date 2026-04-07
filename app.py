@@ -53,34 +53,35 @@ def process_lightspeed(df, version="K-Series"):
     rows = []
 
     for _, r in df.iterrows():
-        vat_string = str(r.get('VAT', '')).strip()
+        vat_string = str(r.get('Taxes', '')).strip()
 
-        # Example: "12.0%=5.46 | 21.0%=1.82"
-        if '=' in vat_string:
-            parts = vat_string.split('|')
+if '=' in vat_string:
+    parts = [p.strip() for p in vat_string.split('|')]
 
-            for part in parts:
-                try:
-                    rate_part, tax_part = part.split('=')
-                    rate = float(rate_part.replace('%','').strip())
-                    tax = float(tax_part.strip())
+    for part in parts:
+        try:
+            rate_part, tax_part = part.split('=')
 
-                    net = round(tax / (rate / 100), 2) if rate != 0 else 0
-                    gross = round(net + tax, 2)
+            rate = float(rate_part.replace('%','').strip())
+            tax = float(tax_part.strip())
 
-                    rows.append({
-                        'order_id': r['order_id'],
-                        'source': r['source'],
-                        'channel': r['channel'],
-                        'order_timestamp': r['order_timestamp'],
-                        'time_of_day': r['time_of_day'],
-                        'vat_rate': f"{int(rate)}%",
-                        'net_sales': net,
-                        'tax': tax,
-                        'gross_sales': gross
-                    })
+            net = round(tax / (rate / 100), 2) if rate != 0 else 0
+            gross = round(net + tax, 2)
 
-                except Exception:
+            rows.append({
+                'order_id': r['order_id'],
+                'source': r['source'],
+                'channel': r['channel'],
+                'order_timestamp': r['order_timestamp'],
+                'time_of_day': r['time_of_day'],
+                'vat_rate': f"{int(rate)}%",
+                'net_sales': net,
+                'tax': tax,
+                'gross_sales': gross
+            })
+
+        except Exception as e:
+            print("Parse error:", part, e)
                     continue
 
         else:
