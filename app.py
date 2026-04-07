@@ -40,18 +40,94 @@ def get_time_of_day(hour):
 def process_lightspeed(df, version="K-Series"):
     if 'Status' in df.columns:
         df = df[df['Status'].isin(['Paid', 'Done'])].copy()
+
     receipt_col = 'Receipt ID' if 'Receipt ID' in df.columns else df.columns[0]
     date_col = 'Creation Date' if 'Creation Date' in df.columns else 'Date'
+
     df['order_id'] = f'LS_{version}_' + df[receipt_col].astype(str)
     df['channel'] = df['Type'].apply(lambda x: 'Takeaway' if str(x).lower() == 'takeaway' else 'In-Restaurant') if 'Type' in df.columns else 'In-Restaurant'
     df['order_timestamp'] = pd.to_datetime(df[date_col], dayfirst=True)
     df['time_of_day'] = df['order_timestamp'].dt.hour.apply(get_time_of_day)
     df['source'] = f'Lightspeed {version}'
-    df['gross_sales'] = pd.to_numeric(df['Total'], errors='coerce').fillna(0)
-    df['net_sales'] = pd.to_numeric(df['Net Total'], errors='coerce').fillna(0)
-    df['tax'] = df['gross_sales'] - df['net_sales']
-    df['vat_rate'] = 'Mixed'
-    return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']]
+
+    # --- BASIC TOTALS ---
+    df['gross_total'] = pd.to_numeric(df['Total'], errors='coerce').fillna(0)
+    df['net_total'] = pd.to_numeric(df['Net Total'], errors='coerce').fillna(0)
+    df['tax_total'] = df['gross_total'] - df['net_total']
+
+    rows = []
+
+    for _, r in df.iterrows():
+        vat_raw = str(r.get('VAT %', '')).strip()
+        tax_raw = str(r.get('VAT', '')).strip()
+
+        # CASE 1: multiple VAT rates present
+        if ',' in vat_raw and ',' in tax_raw:
+            vat_rates = vat_raw.split(',')
+            vat_amounts = tax_raw.split(',')
+
+            if len(vat_rates) == len(vat_amounts):
+                for rate_str, tax_str in zip(vat_rates, vat_amounts):
+                    try:
+                        rate = float(rate_str.replace('%','').strip())
+                        tax = float(tax_str)
+
+                        net = round(tax / (rate / 100), 2) if rate != 0 else 0
+                        gross = round(net + tax, 2)
+
+                        new_row = {
+                            'order_id': r['order_id'],
+                            'source': r['source'],
+                            'channel': r['channel'],
+                            'order_timestamp': r['order_timestamp'],
+                            'time_of_day': r['time_of_day'],
+                            'vat_rate': f"{int(rate)}%",
+                            'net_sales': net,
+                            'tax': tax,
+                            'gross_sales': gross
+                        }
+                        rows.append(new_row)
+                    except:
+                        continue
+            else:
+                # fallback if mismatch
+                rows.append({
+                    'order_id': r['order_id'],
+                    'source': r['source'],
+                    'channel': r['channel'],
+                    'order_timestamp': r['order_timestamp'],
+                    'time_of_day': r['time_of_day'],
+                    'vat_rate': 'Mixed',
+                    'net_sales': r['net_total'],
+                    'tax': r['tax_total'],
+                    'gross_sales': r['gross_total']
+                })
+
+        # CASE 2: single VAT
+        else:
+            rate = vat_raw.replace('%','').strip()
+            rows.append({
+                'order_id': r['order_id'],
+                'source': r['source'],
+                'channel': r['channel'],
+                'order_timestamp': r['order_timestamp'],
+                'time_of_day': r['time_of_day'],
+                'vat_rate': f"{rate}%" if rate else 'Unknown',
+                'net_sales': r['net_total'],
+                'tax': r['tax_total'],
+                'gross_sales': r['gross_total']
+            })
+
+    clean_df = pd.DataFrame(rows)
+
+    # 🔍 sanity check (VERY IMPORTANT)
+    if not clean_df.empty:
+        orig = df['gross_total'].sum()
+        new = clean_df['gross_sales'].sum()
+        if abs(orig - new) > 1:
+            print(f"⚠️ WARNING: totals mismatch {orig} vs {new}")
+
+    return clean_df
 
 def process_ubereats(df):
     df = df[df['Order status'] == 'Completed'].copy()
