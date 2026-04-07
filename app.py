@@ -6,7 +6,11 @@ import io
 
 # Securely connect to Supabase
 DB_URL = st.secrets["SUPABASE_URL"]
-engine = create_engine(DB_URL)
+engine = create_engine(
+    DB_URL,
+    connect_args={"sslmode": "require"},
+    pool_pre_ping=True
+)
 
 import traceback
 
