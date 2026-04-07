@@ -13,36 +13,25 @@ engine = create_engine(
 )
 
 import traceback
-
-def init_db():
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-            conn.commit()
-    except Exception as e:
-        st.error("Connection failed")
-        st.text(str(e))
-        st.text(traceback.format_exc())
-        raise e
         
-#def init_db():
-#    with engine.connect() as conn:
-#        conn.execute(text('''
-#            CREATE TABLE IF NOT EXISTS sales (
-#                id SERIAL PRIMARY KEY,
-#                order_id TEXT,
-#                source TEXT,
-#                channel TEXT,
-#                order_timestamp TIMESTAMP,
-#                time_of_day TEXT,
-#                vat_rate TEXT,
-#                net_sales DOUBLE PRECISION,
-#                tax DOUBLE PRECISION,
-#                gross_sales DOUBLE PRECISION,
-#                UNIQUE(order_id, vat_rate)
-#            )
-#        '''))
-#        conn.commit()
+def init_db():
+    with engine.connect() as conn:
+        conn.execute(text('''
+            CREATE TABLE IF NOT EXISTS sales (
+                id SERIAL PRIMARY KEY,
+                order_id TEXT,
+                source TEXT,
+                channel TEXT,
+                order_timestamp TIMESTAMP,
+                time_of_day TEXT,
+                vat_rate TEXT,
+                net_sales DOUBLE PRECISION,
+                tax DOUBLE PRECISION,
+                gross_sales DOUBLE PRECISION,
+                UNIQUE(order_id, vat_rate)
+            )
+        '''))
+        conn.commit()
 
 def get_time_of_day(hour):
     if pd.isna(hour): return 'Unknown'
