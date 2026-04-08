@@ -34,66 +34,53 @@ def get_time_of_day(hour):
     if pd.isna(hour): return 'Unknown'
     return 'Lunch' if hour < 16 else 'Dinner'
 
+# ✅ FIX 1: Vectorized Lightspeed Parser for massive performance gains
 def process_lightspeed(df, version="K-Series"):
     if 'Status' in df.columns:
         df = df[df['Status'].astype(str).str.strip().isin(['Paid', 'Done'])].copy()
 
     receipt_col = 'Receipt ID' if 'Receipt ID' in df.columns else df.columns[0]
-    
-    if 'Finalized Date' in df.columns:
-        date_col = 'Finalized Date'
-    elif 'Creation Date' in df.columns:
-        date_col = 'Creation Date'
-    else:
-        date_col = 'Date'
+    date_col = next((c for c in ['Finalized Date','Creation Date','Date'] if c in df.columns), df.columns[1])
 
-    df['order_id'] = f'LS_{version}_' + df[receipt_col].astype(str)
-    df['channel'] = df['Type'].apply(
-        lambda x: 'Takeaway' if str(x).lower() == 'takeaway' else 'In-Restaurant'
-    ) if 'Type' in df.columns else 'In-Restaurant'
-
+    df['order_id']        = f'LS_{version}_' + df[receipt_col].astype(str)
+    df['channel']         = df['Type'].apply(lambda x: 'Takeaway' if str(x).lower()=='takeaway' else 'In-Restaurant') if 'Type' in df.columns else 'In-Restaurant'
     df['order_timestamp'] = pd.to_datetime(df[date_col], dayfirst=True)
-    df['time_of_day'] = df['order_timestamp'].dt.hour.apply(get_time_of_day)
-    df['source'] = f'Lightspeed {version}'
+    df['time_of_day']     = df['order_timestamp'].dt.hour.apply(get_time_of_day)
+    df['source']          = f'Lightspeed {version}'
 
-    rows = []
+    has_tax_col = 'Taxes' in df.columns
+    has_vat     = has_tax_col and df['Taxes'].astype(str).str.contains('=').any()
 
-    for _, r in df.iterrows():
-        vat_string = str(r.get('Taxes', '')).strip()
+    if has_vat:
+        # Explode the pipe-separated VAT string into one row per rate
+        base = df[['order_id','source','channel','order_timestamp','time_of_day']].copy()
+        base['vat_parts'] = df['Taxes'].astype(str).str.split('|')
+        exploded = base.explode('vat_parts')
+        exploded = exploded[exploded['vat_parts'].str.contains('=', na=False)].copy()
 
-        if '=' in vat_string:
-            parts = [p.strip() for p in vat_string.split('|')]
-            for part in parts:
-                try:
-                    rate_part, tax_part = part.split('=')
-                    rate = float(rate_part.replace('%','').strip())
-                    tax = float(tax_part.strip())
-                    net = round(tax / (rate / 100), 2) if rate != 0 else 0
-                    gross = round(net + tax, 2)
+        split = exploded['vat_parts'].str.strip().str.split('=', expand=True)
+        exploded['rate']     = pd.to_numeric(split[0].str.replace('%','').str.strip(), errors='coerce')
+        exploded['tax']      = pd.to_numeric(split[1].str.strip(), errors='coerce')
+        exploded = exploded.dropna(subset=['rate','tax'])
+        exploded = exploded[exploded['rate'] > 0]
 
-                    rows.append({
-                        'order_id': r['order_id'], 'source': r['source'], 'channel': r['channel'],
-                        'order_timestamp': r['order_timestamp'], 'time_of_day': r['time_of_day'],
-                        'vat_rate': f"{int(rate)}%", 'net_sales': net, 'tax': tax, 'gross_sales': gross
-                    })
-                except Exception:
-                    continue
-        else:
-            gross = pd.to_numeric(r.get('Total') if pd.notna(r.get('Total')) else r.get('Total incl. Tax', 0), errors='coerce') or 0.0
-            net = pd.to_numeric(r.get('Net Total') if pd.notna(r.get('Net Total')) else r.get('Total excl. Tax', 0), errors='coerce') or 0.0
-            tax = gross - net
+        exploded['net_sales']   = (exploded['tax'] / (exploded['rate'] / 100)).round(2)
+        exploded['gross_sales'] = (exploded['net_sales'] + exploded['tax']).round(2)
+        exploded['vat_rate']    = exploded['rate'].astype(int).astype(str) + '%'
 
-            rows.append({
-                'order_id': r['order_id'], 'source': r['source'], 'channel': r['channel'],
-                'order_timestamp': r['order_timestamp'], 'time_of_day': r['time_of_day'],
-                'vat_rate': 'Mixed', 'net_sales': net, 'tax': tax, 'gross_sales': gross
-            })
-
-    return pd.DataFrame(rows)
+        return exploded[['order_id','source','channel','order_timestamp','time_of_day',
+                          'vat_rate','net_sales','tax','gross_sales']].reset_index(drop=True)
+    else:
+        gross_col = next((c for c in ['Total','Total incl. Tax'] if c in df.columns), None)
+        net_col   = next((c for c in ['Net Total','Total excl. Tax'] if c in df.columns), None)
+        df['gross_sales'] = pd.to_numeric(df[gross_col], errors='coerce').fillna(0) if gross_col else 0.0
+        df['net_sales']   = pd.to_numeric(df[net_col],   errors='coerce').fillna(0) if net_col else 0.0
+        df['tax']         = df['gross_sales'] - df['net_sales']
+        df['vat_rate']    = 'Mixed'
+        return df[['order_id','source','channel','order_timestamp','time_of_day',
+                   'vat_rate','net_sales','tax','gross_sales']].reset_index(drop=True)
     
 def process_ubereats(df):
-    # Bulletproof check for Uber's double header:
-    # If "Order ID" is sitting in the first row of data, push it up to be the actual columns
     first_row_vals = df.iloc[0].astype(str).str.strip().values
     if 'Order ID' in first_row_vals:
         df.columns = first_row_vals
@@ -220,20 +207,33 @@ def save_to_db(clean_df):
     if clean_df.empty:
         return 0, 0
 
+    records = clean_df.to_dict(orient="records")
+    chunk_size = 500  
+    inserted = 0
+
     with engine.begin() as conn:
-        result = conn.execute(text("""
-            INSERT INTO sales (order_id, source, channel, order_timestamp, time_of_day, vat_rate, net_sales, tax, gross_sales)
-            VALUES (:order_id, :source, :channel, :order_timestamp, :time_of_day, :vat_rate, :net_sales, :tax, :gross_sales)
-            ON CONFLICT (order_id, vat_rate) DO NOTHING
-        """), clean_df.to_dict(orient="records"))
-        inserted = result.rowcount
+        for i in range(0, len(records), chunk_size):
+            chunk = records[i : i + chunk_size]
+            result = conn.execute(text("""
+                INSERT INTO sales (order_id, source, channel, order_timestamp, time_of_day, vat_rate, net_sales, tax, gross_sales)
+                VALUES (:order_id, :source, :channel, :order_timestamp, :time_of_day, :vat_rate, :net_sales, :tax, :gross_sales)
+                ON CONFLICT (order_id, vat_rate) DO NOTHING
+            """), chunk)
+            inserted += result.rowcount
 
     skipped = len(clean_df) - inserted
     return inserted, skipped
 
+# ✅ FIX 7: Dynamic data loading to preserve memory for dashboard views
 @st.cache_data(ttl=60)
-def load_data():
-    df = pd.read_sql("SELECT * FROM sales", engine)
+def load_data(full_history=False):
+    if full_history:
+        query = "SELECT * FROM sales ORDER BY order_timestamp"
+    else:
+        # Load only last 13 months for the dashboard to keep it blazing fast
+        query = "SELECT * FROM sales WHERE order_timestamp >= now() - interval '13 months' ORDER BY order_timestamp"
+        
+    df = pd.read_sql(query, engine)
     if not df.empty:
         df['order_timestamp'] = pd.to_datetime(df['order_timestamp'])
         df['order_date'] = df['order_timestamp'].dt.date
@@ -248,6 +248,11 @@ st.set_page_config(page_title="Restaurant OS", layout="wide")
 init_db()
 
 st.sidebar.title("Data Sync")
+
+# ✅ FIX 3: Safe placeholder for pop-up messages
+msg_placeholder = st.sidebar.empty()
+if 'import_msg' in st.session_state:
+    msg_placeholder.success(st.session_state.pop('import_msg'))
 
 with st.sidebar.expander("How to update", expanded=True):
     st.markdown("""
@@ -264,13 +269,8 @@ if st.sidebar.button("Process File"):
     if uploaded_file:
         raw = uploaded_file.read()
         try:
-            # Revert to safe parsing: try comma, then semicolon
-            try:
-                df_raw = pd.read_csv(io.BytesIO(raw), sep=',')
-                if len(df_raw.columns) < 3:
-                    df_raw = pd.read_csv(io.BytesIO(raw), sep=';')
-            except:
-                df_raw = pd.read_csv(io.BytesIO(raw), sep=';')
+            # ✅ FIX 2: Python engine auto-detects delimiter (comma vs semicolon)
+            df_raw = pd.read_csv(io.BytesIO(raw), sep=None, engine='python')
             
             parsers = {
                 "Lightspeed K-Series": lambda d: process_lightspeed(d, "K-Series"),
@@ -282,17 +282,19 @@ if st.sidebar.button("Process File"):
 
             clean_df = parsers[source_option](df_raw)
             if clean_df.empty:
-                st.sidebar.warning("No new or valid completed orders found in this file.")
+                st.session_state['import_msg'] = "⚠️ No new or valid completed orders found in this file."
             else:
                 inserted, skipped = save_to_db(clean_df)
-                st.sidebar.success(f"✅ Import completed: {inserted} rows added ({skipped} duplicates skipped).")
-                st.cache_data.clear()
-                st.rerun()
+                st.session_state['import_msg'] = f"✅ Import completed: {inserted} rows added ({skipped} duplicates skipped)."
+                
+            st.cache_data.clear()
+            st.rerun()
             
         except Exception as e:
             st.sidebar.error(f"Error parsing file: {e}")
 
-data = load_data()
+# Load recent data for Sidebar Info and Dashboard
+data = load_data(full_history=False)
 
 if not data.empty:
     st.sidebar.markdown("---")
@@ -319,9 +321,9 @@ if st.sidebar.button("🧹 Clean Database"):
             count_after = conn.execute(text("SELECT COUNT(*) FROM sales")).scalar()
             removed = count_before - count_after
             if removed > 0:
-                st.sidebar.success(f"✅ Cleaned! Removed {removed} duplicate rows.")
+                st.session_state['import_msg'] = f"✅ Cleaned! Removed {removed} duplicate rows."
             else:
-                st.sidebar.info("Database is already clean! No duplicates found.")
+                st.session_state['import_msg'] = "Database is already clean! No duplicates found."
             st.cache_data.clear()
             st.rerun()
     except Exception as e:
@@ -339,10 +341,12 @@ with tab_dash:
         
         date_range = st.date_input("Filter Dashboard Date Range", [min_date_db, max_date_db], min_value=min_date_db, max_value=max_date_db)
         
-        if len(date_range) == 2:
-            dash_data = data[(data['order_date'] >= date_range[0]) & (data['order_date'] <= date_range[1])]
-        else:
-            dash_data = data
+        # ✅ FIX 5: Handle single date clicks smoothly
+        if len(date_range) != 2:
+            st.warning("Please select both a start and end date to view the dashboard.")
+            st.stop()
+            
+        dash_data = data[(data['order_date'] >= date_range[0]) & (data['order_date'] <= date_range[1])]
             
         total = dash_data['gross_sales'].sum()
         days = dash_data['order_date'].nunique() or 1
@@ -379,12 +383,16 @@ with tab_dash:
 
 with tab_vat:
     st.header("VAT Report")
-    if data.empty:
+    
+    # Ensure full database history is loaded for accurate VAT reporting
+    vat_data = load_data(full_history=True)
+    
+    if vat_data.empty:
         st.info("No data yet.")
     else:
-        quarters = sorted(data['quarter'].unique(), reverse=True)
+        quarters = sorted(vat_data['quarter'].unique(), reverse=True)
         selected_q = st.selectbox("Quarter", quarters)
-        q_data = data[data['quarter'] == selected_q]
+        q_data = vat_data[vat_data['quarter'] == selected_q]
 
         summary = q_data.groupby(['source','vat_rate'])[['net_sales','tax','gross_sales']].sum().reset_index()
         summary.columns = ['Source', 'VAT rate', 'Net', 'VAT', 'Gross']
