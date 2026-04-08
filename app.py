@@ -25,9 +25,13 @@ def init_db():
                 vat_rate TEXT,
                 net_sales DOUBLE PRECISION,
                 tax DOUBLE PRECISION,
-                gross_sales DOUBLE PRECISION,
-                UNIQUE(order_id, vat_rate)
+                gross_sales DOUBLE PRECISION
             )
+        '''))
+        # Regular index for fast duplicate pre-filtering — not unique
+        conn.execute(text('''
+            CREATE INDEX IF NOT EXISTS idx_sales_source_order_vat
+                ON sales(source, order_id, vat_rate)
         '''))
 
 def get_time_of_day(hour):
@@ -249,34 +253,49 @@ def process_takeaway(df):
     
     return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']]
 
-# ✅ BLAZING FAST, PRE-FILTERED DB INSERT WITH PROGRESS TRACKING
+# ✅ BLAZING FAST, VECTORIZED DB INSERT WITH PROGRESS TRACKING
 def save_to_db_with_progress(clean_df, progress_bar=None):
     if clean_df.empty:
         return 0, 0
 
-    sources = clean_df['source'].unique().tolist()
+    # ── Step 1: fetch existing keys for this source ───────────────────────
+    sources      = clean_df['source'].unique().tolist()
     placeholders = ', '.join(f':s{i}' for i in range(len(sources)))
 
+    if progress_bar:
+        progress_bar.progress(0.05, text="Checking database for existing records...")
+
     with engine.connect() as conn:
-        existing = conn.execute(text(f"""
-            SELECT order_id, vat_rate FROM sales
-            WHERE source IN ({placeholders})
-        """), {f's{i}': s for i, s in enumerate(sources)})
-        existing_keys = set((str(r.order_id), str(r.vat_rate)) for r in existing)
+        result = conn.execute(
+            text(f"SELECT order_id, vat_rate FROM sales WHERE source IN ({placeholders})"),
+            {f's{i}': s for i, s in enumerate(sources)}
+        )
+        existing_df = pd.DataFrame(result.fetchall(), columns=['order_id', 'vat_rate'])
 
-    new_df = clean_df[
-        ~clean_df.apply(lambda r: (str(r['order_id']), str(r['vat_rate'])) in existing_keys, axis=1)
-    ].copy()
+    # ── Step 2: vectorized dedup — no Python loop ─────────────────────────
+    if not existing_df.empty:
+        existing_keys = set(
+            existing_df['order_id'].astype(str) + '||' + existing_df['vat_rate'].astype(str)
+        )
+    else:
+        existing_keys = set()
 
+    clean_df = clean_df.copy()
+    clean_df['_key'] = clean_df['order_id'].astype(str) + '||' + clean_df['vat_rate'].astype(str)
+    new_df   = clean_df[~clean_df['_key'].isin(existing_keys)].drop(columns=['_key']).copy()
     skipped  = len(clean_df) - len(new_df)
-    inserted = 0
+
+    if progress_bar:
+        progress_bar.progress(0.2, text=f"Found {len(new_df)} new rows to insert ({skipped} duplicates skipped)...")
 
     if new_df.empty:
         return 0, skipped
 
+    # ── Step 3: insert in chunks ──────────────────────────────────────────
     records    = new_df.to_dict(orient="records")
-    chunk_size = 500  # Safe to go faster since duplicates are gone!
+    chunk_size = 500
     total      = len(records)
+    inserted   = 0
 
     for i in range(0, total, chunk_size):
         chunk = records[i : i + chunk_size]
@@ -293,8 +312,8 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
 
         if progress_bar:
             progress_bar.progress(
-                min((i + chunk_size) / total, 1.0),
-                text=f"Saving to DB... {min(i + chunk_size, total)}/{total} new rows added"
+                0.2 + 0.8 * min((i + chunk_size) / total, 1.0),
+                text=f"Inserting... {min(i + chunk_size, total)}/{total} rows"
             )
 
     return inserted, skipped
@@ -391,8 +410,11 @@ if st.sidebar.button("🧹 Clean Database"):
             count_before = conn.execute(text("SELECT COUNT(*) FROM sales")).scalar()
             conn.execute(text("""
                 DELETE FROM sales
-                WHERE id NOT IN (
-                    SELECT MIN(id) FROM sales GROUP BY order_id, vat_rate
+                WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER(PARTITION BY order_id, vat_rate ORDER BY id) as row_num
+                        FROM sales
+                    ) t WHERE t.row_num > 1
                 )
             """))
             count_after = conn.execute(text("SELECT COUNT(*) FROM sales")).scalar()
