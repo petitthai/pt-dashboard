@@ -36,7 +36,7 @@ def get_time_of_day(hour):
 
 def process_lightspeed(df, version="K-Series"):
     if 'Status' in df.columns:
-        df = df[df['Status'].isin(['Paid', 'Done'])].copy()
+        df = df[df['Status'].astype(str).str.strip().isin(['Paid', 'Done'])].copy()
 
     receipt_col = 'Receipt ID' if 'Receipt ID' in df.columns else df.columns[0]
     
@@ -92,13 +92,20 @@ def process_lightspeed(df, version="K-Series"):
     return pd.DataFrame(rows)
     
 def process_ubereats(df):
-    if 'Order ID as per Uber Eats manager' in df.columns:
-        new_header = df.iloc[0]
-        df = df[1:].copy()
-        df.columns = new_header
+    # Bulletproof check for Uber's double header:
+    # If "Order ID" is sitting in the first row of data, push it up to be the actual columns
+    first_row_vals = df.iloc[0].astype(str).str.strip().values
+    if 'Order ID' in first_row_vals:
+        df.columns = first_row_vals
+        df = df.iloc[1:].copy()
         
-    df.columns = df.columns.str.strip()
-    df = df[df['Order status'] == 'Completed'].copy()
+    df.columns = df.columns.astype(str).str.strip()
+    
+    if 'Order status' not in df.columns:
+        st.error(f"❌ Uber Eats format not recognized. Cannot find 'Order status'. Columns found: {', '.join(df.columns.tolist()[:5])}...")
+        return pd.DataFrame()
+        
+    df = df[df['Order status'].astype(str).str.strip() == 'Completed'].copy()
     
     rows = []
     
@@ -109,8 +116,10 @@ def process_ubereats(df):
     }
     
     for _, r in df.iterrows():
-        order_id = 'UE_' + str(r['Order ID'])
-        timestamp = pd.to_datetime(str(r['Order date']) + ' ' + str(r['Order confirmed time']), dayfirst=True, errors='coerce')
+        order_val = r.get('Order ID') or r.iloc[0]
+        order_id = 'UE_' + str(order_val)
+        
+        timestamp = pd.to_datetime(str(r.get('Order date', '')) + ' ' + str(r.get('Order confirmed time', '')), dayfirst=True, errors='coerce')
         time_of_day = get_time_of_day(timestamp.hour if pd.notnull(timestamp) else None)
         
         total_net = pd.to_numeric(r.get('Sales (excl. VAT)', 0), errors='coerce')
@@ -119,6 +128,9 @@ def process_ubereats(df):
         found_tax = False
         
         for vat_col, rate_label in VAT_RATE_MAP.items():
+            if vat_col not in r:
+                continue
+                
             tax_amount = pd.to_numeric(r.get(vat_col, 0), errors='coerce')
             if pd.isna(tax_amount) or tax_amount <= 0:
                 continue
@@ -144,10 +156,10 @@ def process_ubereats(df):
     return pd.DataFrame(rows)
 
 def process_deliveroo(df):
-    df.columns = df.columns.str.strip()
+    df.columns = df.columns.astype(str).str.strip()
 
     if len(df.columns) == 1:
-        df = df[df.columns[0]].str.split(",", expand=True)
+        df = df[df.columns[0]].astype(str).str.split(",", expand=True)
         df.columns = [
             'Restaurant name','Order number','Order status',
             'Date submitted','Time submitted',
@@ -156,7 +168,7 @@ def process_deliveroo(df):
         ]
 
     if 'Order status' in df.columns:
-        df = df[df['Order status'] == 'Completed'].copy()
+        df = df[df['Order status'].astype(str).str.strip() == 'Completed'].copy()
     else:
         st.error("❌ Deliveroo file format not recognized")
         return pd.DataFrame()
@@ -166,7 +178,7 @@ def process_deliveroo(df):
     df['source'] = 'Deliveroo'
 
     df['order_timestamp'] = pd.to_datetime(
-        df['Date submitted'] + ' ' + df['Time submitted'],
+        df['Date submitted'].astype(str) + ' ' + df['Time submitted'].astype(str),
         errors='coerce',
         dayfirst=True
     )
@@ -181,7 +193,7 @@ def process_deliveroo(df):
 
 def process_takeaway(df):
     df = df.copy()
-    df.columns = df.columns.str.strip()
+    df.columns = df.columns.astype(str).str.strip()
     
     df['order_id'] = 'TA_' + df['Order'].astype(str)
     
@@ -252,7 +264,13 @@ if st.sidebar.button("Process File"):
     if uploaded_file:
         raw = uploaded_file.read()
         try:
-            df_raw = pd.read_csv(io.BytesIO(raw), sep=None, engine='python')
+            # Revert to safe parsing: try comma, then semicolon
+            try:
+                df_raw = pd.read_csv(io.BytesIO(raw), sep=',')
+                if len(df_raw.columns) < 3:
+                    df_raw = pd.read_csv(io.BytesIO(raw), sep=';')
+            except:
+                df_raw = pd.read_csv(io.BytesIO(raw), sep=';')
             
             parsers = {
                 "Lightspeed K-Series": lambda d: process_lightspeed(d, "K-Series"),
@@ -263,11 +281,13 @@ if st.sidebar.button("Process File"):
             }
 
             clean_df = parsers[source_option](df_raw)
-            inserted, skipped = save_to_db(clean_df)
-
-            st.sidebar.success(f"✅ Import completed: {inserted} rows added ({skipped} duplicates skipped).")
-            st.cache_data.clear()
-            st.rerun()
+            if clean_df.empty:
+                st.sidebar.warning("No new or valid completed orders found in this file.")
+            else:
+                inserted, skipped = save_to_db(clean_df)
+                st.sidebar.success(f"✅ Import completed: {inserted} rows added ({skipped} duplicates skipped).")
+                st.cache_data.clear()
+                st.rerun()
             
         except Exception as e:
             st.sidebar.error(f"Error parsing file: {e}")
