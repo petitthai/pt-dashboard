@@ -40,7 +40,14 @@ def process_lightspeed(df, version="K-Series"):
         df = df[df['Status'].isin(['Paid', 'Done'])].copy()
 
     receipt_col = 'Receipt ID' if 'Receipt ID' in df.columns else df.columns[0]
-    date_col = 'Creation Date' if 'Creation Date' in df.columns else 'Date'
+    
+    # Prioritize Finalized Date for L-Series, then Creation Date, then Date
+    if 'Finalized Date' in df.columns:
+        date_col = 'Finalized Date'
+    elif 'Creation Date' in df.columns:
+        date_col = 'Creation Date'
+    else:
+        date_col = 'Date'
 
     df['order_id'] = f'LS_{version}_' + df[receipt_col].astype(str)
     df['channel'] = df['Type'].apply(
@@ -217,11 +224,20 @@ uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
 
 data = load_data()
 
-# ✅ data range info
+# ✅ data range info for ALL sources
 if not data.empty:
-    src_data = data[data['source'] == source_option]
-    if not src_data.empty:
-        st.sidebar.info(f"Data in DB: {src_data['order_timestamp'].min().date()} → {src_data['order_timestamp'].max().date()}")
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**📅 Data currently in DB:**")
+    
+    summary_dates = data.groupby('source')['order_timestamp'].agg(['min', 'max']).reset_index()
+    
+    for _, row in summary_dates.iterrows():
+        src = row['source']
+        min_date = row['min'].date()
+        max_date = row['max'].date()
+        st.sidebar.caption(f"**{src}**\n{min_date} to {max_date}")
+    
+    st.sidebar.markdown("---")
 
 if st.sidebar.button("Process File"):
     if uploaded_file:
