@@ -34,7 +34,6 @@ def get_time_of_day(hour):
     if pd.isna(hour): return 'Unknown'
     return 'Lunch' if hour < 16 else 'Dinner'
 
-# Vectorized Lightspeed Parser for massive performance gains
 def process_lightspeed(df, version="K-Series"):
     if 'Status' in df.columns:
         df = df[df['Status'].astype(str).str.strip().isin(['Paid', 'Done'])].copy()
@@ -179,48 +178,84 @@ def process_deliveroo(df):
 
 def process_takeaway(df):
     df = df.copy()
-    df.columns = df.columns.astype(str).str.strip()
+    # Aggressively strip quotes and spaces to fix the 'Order' KeyError
+    df.columns = df.columns.astype(str).str.strip().str.replace('"', '').str.replace("'", "")
     
-    df['order_id'] = 'TA_' + df['Order'].astype(str)
+    # Safely find columns ignoring case
+    order_col = next((c for c in df.columns if 'order' in c.lower()), 'Order')
+    pickup_col = next((c for c in df.columns if 'pickup' in c.lower()), 'Pickup')
+    date_col = next((c for c in df.columns if 'date' in c.lower()), 'Date')
+    total_col = next((c for c in df.columns if 'total amount' in c.lower() or 'total' in c.lower()), 'Total amount')
+
+    df['order_id'] = 'TA_' + df[order_col].astype(str)
     
-    if 'Pickup' in df.columns:
-        df['channel'] = df['Pickup'].apply(lambda x: 'Takeaway' if str(x).strip().lower() == 'yes' else 'Delivery')
+    if pickup_col in df.columns:
+        df['channel'] = df[pickup_col].apply(lambda x: 'Takeaway' if str(x).strip().lower() == 'yes' else 'Delivery')
     else:
         df['channel'] = 'Delivery'
         
     df['source'] = 'Takeaway'
-    df['order_timestamp'] = pd.to_datetime(df['Date'], dayfirst=True)
+    df['order_timestamp'] = pd.to_datetime(df[date_col], errors='coerce')
     df['time_of_day'] = df['order_timestamp'].dt.hour.apply(get_time_of_day)
     
-    if df['Total amount'].dtype == object:
-        df['Total amount'] = df['Total amount'].str.replace(',', '.')
+    if df[total_col].dtype == object:
+        df[total_col] = df[total_col].str.replace(',', '.')
         
-    df['gross_sales'] = pd.to_numeric(df['Total amount'], errors='coerce').fillna(0)
+    df['gross_sales'] = pd.to_numeric(df[total_col], errors='coerce').fillna(0)
     df['net_sales'] = (df['gross_sales'] / 1.06).round(2)
     df['tax'] = df['gross_sales'] - df['net_sales']
     df['vat_rate'] = '6%'
     
     return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']]
 
-def save_to_db(clean_df):
+# ✅ BLAZING FAST, PRE-FILTERED DB INSERT WITH PROGRESS TRACKING
+def save_to_db_with_progress(clean_df, progress_bar=None):
     if clean_df.empty:
         return 0, 0
 
-    records = clean_df.to_dict(orient="records")
-    chunk_size = 500  
+    sources = clean_df['source'].unique().tolist()
+    placeholders = ', '.join(f':s{i}' for i in range(len(sources)))
+
+    with engine.connect() as conn:
+        existing = conn.execute(text(f"""
+            SELECT order_id, vat_rate FROM sales
+            WHERE source IN ({placeholders})
+        """), {f's{i}': s for i, s in enumerate(sources)})
+        existing_keys = set((str(r.order_id), str(r.vat_rate)) for r in existing)
+
+    new_df = clean_df[
+        ~clean_df.apply(lambda r: (str(r['order_id']), str(r['vat_rate'])) in existing_keys, axis=1)
+    ].copy()
+
+    skipped  = len(clean_df) - len(new_df)
     inserted = 0
 
-    with engine.begin() as conn:
-        for i in range(0, len(records), chunk_size):
-            chunk = records[i : i + chunk_size]
+    if new_df.empty:
+        return 0, skipped
+
+    records    = new_df.to_dict(orient="records")
+    chunk_size = 500  # Safe to go faster since duplicates are gone!
+    total      = len(records)
+
+    for i in range(0, total, chunk_size):
+        chunk = records[i : i + chunk_size]
+        with engine.begin() as conn:
             result = conn.execute(text("""
-                INSERT INTO sales (order_id, source, channel, order_timestamp, time_of_day, vat_rate, net_sales, tax, gross_sales)
-                VALUES (:order_id, :source, :channel, :order_timestamp, :time_of_day, :vat_rate, :net_sales, :tax, :gross_sales)
-                ON CONFLICT (order_id, vat_rate) DO NOTHING
+                INSERT INTO sales
+                    (order_id, source, channel, order_timestamp,
+                     time_of_day, vat_rate, net_sales, tax, gross_sales)
+                VALUES
+                    (:order_id, :source, :channel, :order_timestamp,
+                     :time_of_day, :vat_rate, :net_sales, :tax, :gross_sales)
             """), chunk)
             inserted += result.rowcount
 
-    skipped = len(clean_df) - inserted
+        if progress_bar:
+            progress_bar.progress(
+                min((i + chunk_size) / total, 1.0),
+                text=f"Saving to DB... {min(i + chunk_size, total)}/{total} new rows added"
+            )
+
     return inserted, skipped
 
 @st.cache_data(ttl=60)
@@ -228,7 +263,6 @@ def load_data(full_history=False):
     if full_history:
         query = "SELECT * FROM sales ORDER BY order_timestamp"
     else:
-        # ✅ FIX: Increased from 13 months to 36 months for deeper historical dashboard views
         query = "SELECT * FROM sales WHERE order_timestamp >= now() - interval '36 months' ORDER BY order_timestamp"
         
     df = pd.read_sql(query, engine)
@@ -276,12 +310,19 @@ if st.sidebar.button("Process File"):
                 "Takeaway": process_takeaway,
             }
 
-            clean_df = parsers[source_option](df_raw)
+            with st.spinner("Parsing file..."):
+                clean_df = parsers[source_option](df_raw)
+
             if clean_df.empty:
-                st.session_state['import_msg'] = "⚠️ No new or valid completed orders found in this file."
+                st.session_state['import_msg'] = "⚠️ No valid completed orders found in this file."
             else:
-                inserted, skipped = save_to_db(clean_df)
-                st.session_state['import_msg'] = f"✅ Import completed: {inserted} rows added ({skipped} duplicates skipped)."
+                progress = st.sidebar.progress(0, text="Checking database for duplicates...")
+                inserted, skipped = save_to_db_with_progress(clean_df, progress)
+                progress.empty()
+
+                st.session_state['import_msg'] = (
+                    f"✅ Import completed: {inserted} rows added, {skipped} duplicates skipped."
+                )
                 
             st.cache_data.clear()
             st.rerun()
