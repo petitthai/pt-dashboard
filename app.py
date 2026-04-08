@@ -34,7 +34,7 @@ def get_time_of_day(hour):
     if pd.isna(hour): return 'Unknown'
     return 'Lunch' if hour < 16 else 'Dinner'
 
-# ✅ FIX 1: Vectorized Lightspeed Parser for massive performance gains
+# Vectorized Lightspeed Parser for massive performance gains
 def process_lightspeed(df, version="K-Series"):
     if 'Status' in df.columns:
         df = df[df['Status'].astype(str).str.strip().isin(['Paid', 'Done'])].copy()
@@ -52,7 +52,6 @@ def process_lightspeed(df, version="K-Series"):
     has_vat     = has_tax_col and df['Taxes'].astype(str).str.contains('=').any()
 
     if has_vat:
-        # Explode the pipe-separated VAT string into one row per rate
         base = df[['order_id','source','channel','order_timestamp','time_of_day']].copy()
         base['vat_parts'] = df['Taxes'].astype(str).str.split('|')
         exploded = base.explode('vat_parts')
@@ -224,14 +223,13 @@ def save_to_db(clean_df):
     skipped = len(clean_df) - inserted
     return inserted, skipped
 
-# ✅ FIX 7: Dynamic data loading to preserve memory for dashboard views
 @st.cache_data(ttl=60)
 def load_data(full_history=False):
     if full_history:
         query = "SELECT * FROM sales ORDER BY order_timestamp"
     else:
-        # Load only last 13 months for the dashboard to keep it blazing fast
-        query = "SELECT * FROM sales WHERE order_timestamp >= now() - interval '13 months' ORDER BY order_timestamp"
+        # ✅ FIX: Increased from 13 months to 36 months for deeper historical dashboard views
+        query = "SELECT * FROM sales WHERE order_timestamp >= now() - interval '36 months' ORDER BY order_timestamp"
         
     df = pd.read_sql(query, engine)
     if not df.empty:
@@ -249,7 +247,6 @@ init_db()
 
 st.sidebar.title("Data Sync")
 
-# ✅ FIX 3: Safe placeholder for pop-up messages
 msg_placeholder = st.sidebar.empty()
 if 'import_msg' in st.session_state:
     msg_placeholder.success(st.session_state.pop('import_msg'))
@@ -269,7 +266,6 @@ if st.sidebar.button("Process File"):
     if uploaded_file:
         raw = uploaded_file.read()
         try:
-            # ✅ FIX 2: Python engine auto-detects delimiter (comma vs semicolon)
             df_raw = pd.read_csv(io.BytesIO(raw), sep=None, engine='python')
             
             parsers = {
@@ -293,7 +289,6 @@ if st.sidebar.button("Process File"):
         except Exception as e:
             st.sidebar.error(f"Error parsing file: {e}")
 
-# Load recent data for Sidebar Info and Dashboard
 data = load_data(full_history=False)
 
 if not data.empty:
@@ -341,7 +336,6 @@ with tab_dash:
         
         date_range = st.date_input("Filter Dashboard Date Range", [min_date_db, max_date_db], min_value=min_date_db, max_value=max_date_db)
         
-        # ✅ FIX 5: Handle single date clicks smoothly
         if len(date_range) != 2:
             st.warning("Please select both a start and end date to view the dashboard.")
             st.stop()
@@ -384,7 +378,6 @@ with tab_dash:
 with tab_vat:
     st.header("VAT Report")
     
-    # Ensure full database history is loaded for accurate VAT reporting
     vat_data = load_data(full_history=True)
     
     if vat_data.empty:
