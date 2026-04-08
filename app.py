@@ -35,49 +35,90 @@ def get_time_of_day(hour):
     return 'Lunch' if hour < 16 else 'Dinner'
 
 def process_lightspeed(df, version="K-Series"):
-    if 'Status' in df.columns:
-        df = df[df['Status'].astype(str).str.strip().isin(['Paid', 'Done'])].copy()
+    df.columns = df.columns.astype(str).str.strip()
 
-    receipt_col = 'Receipt ID' if 'Receipt ID' in df.columns else df.columns[0]
-    date_col = next((c for c in ['Finalized Date','Creation Date','Date'] if c in df.columns), df.columns[1])
+    # ── Detect format: K-series (Identifier col) vs L-series (Receipt ID col) ──
+    is_kseries = 'Identifier' in df.columns
+
+    if is_kseries:
+        # K-series: filter by Type=SALE and Canceled=No
+        if 'Type' in df.columns:
+            df = df[df['Type'].astype(str).str.strip() == 'SALE'].copy()
+        if 'Canceled' in df.columns:
+            df = df[df['Canceled'].astype(str).str.strip() == 'No'].copy()
+        receipt_col = 'Identifier'
+        tax_col     = 'TaxName'      # format: "BTW 12%:9.21|BTW 21%:2.78"
+        tax_sep     = ':'            # separator between rate label and amount
+        rate_prefix = 'BTW '        # prefix to strip to get numeric rate
+    else:
+        # L-series: filter by Status
+        if 'Status' in df.columns:
+            df = df[df['Status'].astype(str).str.strip().isin(['Paid', 'Done'])].copy()
+        receipt_col = 'Receipt ID' if 'Receipt ID' in df.columns else df.columns[0]
+        tax_col     = 'Taxes'        # format: "12%=1.5|21%=2.78"
+        tax_sep     = '='
+        rate_prefix = ''
+
+    date_col = next(
+        (c for c in ['Finalized Date', 'Creation Date', 'Date'] if c in df.columns),
+        df.columns[1]
+    )
 
     df['order_id']        = f'LS_{version}_' + df[receipt_col].astype(str)
-    df['channel']         = df['Type'].apply(lambda x: 'Takeaway' if str(x).lower()=='takeaway' else 'In-Restaurant') if 'Type' in df.columns else 'In-Restaurant'
     df['order_timestamp'] = pd.to_datetime(df[date_col], dayfirst=True)
     df['time_of_day']     = df['order_timestamp'].dt.hour.apply(get_time_of_day)
     df['source']          = f'Lightspeed {version}'
 
-    has_tax_col = 'Taxes' in df.columns
-    has_vat     = has_tax_col and df['Taxes'].astype(str).str.contains('=').any()
+    # Channel detection
+    if 'Type' in df.columns and not is_kseries:
+        df['channel'] = df['Type'].apply(
+            lambda x: 'Takeaway' if str(x).lower() == 'takeaway' else 'In-Restaurant'
+        )
+    elif 'Mode' in df.columns:
+        df['channel'] = df['Mode'].apply(
+            lambda x: 'Takeaway' if str(x).lower() in ['takeout', 'takeaway', 'take-away'] else 'In-Restaurant'
+        )
+    else:
+        df['channel'] = 'In-Restaurant'
+
+    # ── VAT parsing ──────────────────────────────────────────────────────────
+    has_tax = tax_col in df.columns
+    has_vat = has_tax and df[tax_col].astype(str).str.contains(tax_sep, na=False).any()
 
     if has_vat:
-        base = df[['order_id','source','channel','order_timestamp','time_of_day']].copy()
-        base['vat_parts'] = df['Taxes'].astype(str).str.split('|')
+        base = df[['order_id', 'source', 'channel', 'order_timestamp', 'time_of_day']].copy()
+        base['vat_parts'] = df[tax_col].astype(str).str.split('|')
         exploded = base.explode('vat_parts')
-        exploded = exploded[exploded['vat_parts'].str.contains('=', na=False)].copy()
+        exploded = exploded[exploded['vat_parts'].str.contains(tax_sep, na=False)].copy()
 
-        split = exploded['vat_parts'].str.strip().str.split('=', expand=True)
-        exploded['rate']     = pd.to_numeric(split[0].str.replace('%','').str.strip(), errors='coerce')
-        exploded['tax']      = pd.to_numeric(split[1].str.strip(), errors='coerce')
-        exploded = exploded.dropna(subset=['rate','tax'])
-        exploded = exploded[exploded['rate'] > 0]
+        split = exploded['vat_parts'].str.strip().str.split(tax_sep, expand=True)
+
+        # Extract numeric rate — strip "BTW " prefix and "%" suffix
+        rate_str = split[0].str.replace(rate_prefix, '', regex=False).str.replace('%', '', regex=False).str.strip()
+        exploded['rate'] = pd.to_numeric(rate_str, errors='coerce')
+        exploded['tax']  = pd.to_numeric(split[1].str.strip(), errors='coerce')
+
+        exploded = exploded.dropna(subset=['rate', 'tax'])
+        exploded = exploded[(exploded['rate'] > 0) & (exploded['tax'] > 0)]
 
         exploded['net_sales']   = (exploded['tax'] / (exploded['rate'] / 100)).round(2)
         exploded['gross_sales'] = (exploded['net_sales'] + exploded['tax']).round(2)
         exploded['vat_rate']    = exploded['rate'].astype(int).astype(str) + '%'
 
-        return exploded[['order_id','source','channel','order_timestamp','time_of_day',
-                          'vat_rate','net_sales','tax','gross_sales']].reset_index(drop=True)
+        return exploded[['order_id', 'source', 'channel', 'order_timestamp', 'time_of_day',
+                          'vat_rate', 'net_sales', 'tax', 'gross_sales']].reset_index(drop=True)
+
     else:
-        gross_col = next((c for c in ['Total','Total incl. Tax'] if c in df.columns), None)
-        net_col   = next((c for c in ['Net Total','Total excl. Tax'] if c in df.columns), None)
+        # Fallback: no VAT breakdown available, use totals
+        gross_col = next((c for c in ['Total', 'Total incl. Tax'] if c in df.columns), None)
+        net_col   = next((c for c in ['PreTax', 'Net Total', 'Total excl. Tax'] if c in df.columns), None)
         df['gross_sales'] = pd.to_numeric(df[gross_col], errors='coerce').fillna(0) if gross_col else 0.0
         df['net_sales']   = pd.to_numeric(df[net_col],   errors='coerce').fillna(0) if net_col else 0.0
         df['tax']         = df['gross_sales'] - df['net_sales']
         df['vat_rate']    = 'Mixed'
-        return df[['order_id','source','channel','order_timestamp','time_of_day',
-                   'vat_rate','net_sales','tax','gross_sales']].reset_index(drop=True)
-    
+        return df[['order_id', 'source', 'channel', 'order_timestamp', 'time_of_day',
+                   'vat_rate', 'net_sales', 'tax', 'gross_sales']].reset_index(drop=True)
+        
 def process_ubereats(df):
     first_row_vals = df.iloc[0].astype(str).str.strip().values
     if 'Order ID' in first_row_vals:
