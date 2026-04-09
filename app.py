@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from sqlalchemy import create_engine, text
 import plotly.express as px
 import io
@@ -36,10 +37,7 @@ def init_db():
                 ON sales(source, order_id, vat_rate)
         '''))
 
-def get_time_of_day(hour):
-    if pd.isna(hour): return 'Unknown'
-    return 'Lunch' if hour < 16 else 'Dinner'
-
+# Razendsnelle (gevectoriseerde) Lightspeed verwerking voor reusachtige bestanden
 def process_lightspeed(df):
     df.columns = df.columns.astype(str).str.strip()
 
@@ -59,7 +57,6 @@ def process_lightspeed(df):
         rate_prefix = 'BTW '        
     else:
         if 'Status' in df.columns:
-            # ✅ Extra beveiliging voor NL/FR exports van Lightspeed
             valid_statuses = ['Paid', 'Done', 'Betaald', 'Afgerekend', 'Payé', 'Terminé', 'Voltooid']
             df = df[df['Status'].astype(str).str.strip().isin(valid_statuses)].copy()
         receipt_col = 'Receipt ID' if 'Receipt ID' in df.columns else df.columns[0]
@@ -71,6 +68,10 @@ def process_lightspeed(df):
         return pd.DataFrame()
 
     df = df.dropna(subset=[receipt_col])
+    
+    # 🔥 ULTIEME MEMORY FIX: Gooi L-Series dubbels (lijn-niveau) direct weg aan het begin! 
+    # Dit voorkomt dat we datums en labels berekenen voor 50.000 rijen als er maar 10.000 bonnetjes zijn.
+    df = df.drop_duplicates(subset=[receipt_col]).copy()
 
     date_col = next(
         (c for c in ['Finalized Date', 'Creation Date', 'Date'] if c in df.columns),
@@ -78,29 +79,36 @@ def process_lightspeed(df):
     )
     gross_col = next((c for c in ['Total','Total incl. Tax'] if c in df.columns), None)
 
-    df['order_id']        = f'LS_{version}_' + df[receipt_col].astype(str)
+    df['order_id'] = f'LS_{version}_' + df[receipt_col].astype(str)
     
     if is_kseries:
-        df['channel'] = df['Mode'].apply(
-            lambda x: 'Takeaway' if str(x).lower() in ['takeout', 'takeaway', 'take-away', 'afhaal', 'emporter'] else 'In-Restaurant'
-        ) if 'Mode' in df.columns else 'In-Restaurant'
+        if 'Mode' in df.columns:
+            df['channel'] = np.where(df['Mode'].astype(str).str.lower().str.strip().isin(['takeout', 'takeaway', 'take-away', 'afhaal', 'emporter']), 'Takeaway', 'In-Restaurant')
+        else:
+            df['channel'] = 'In-Restaurant'
     else:
-        df['channel'] = df['Type'].apply(
-            lambda x: 'Takeaway' if str(x).lower() in ['takeaway', 'afhaal', 'emporter'] else 'In-Restaurant'
-        ) if 'Type' in df.columns else 'In-Restaurant'
-        
-    df['order_timestamp'] = pd.to_datetime(df[date_col], dayfirst=True, errors='coerce')
-    df['time_of_day']     = df['order_timestamp'].dt.hour.apply(get_time_of_day)
-    df['source']          = f'Lightspeed {version}'
-    df['receipt_total']   = pd.to_numeric(df[gross_col], errors='coerce').fillna(0) if gross_col else 0.0
+        if 'Type' in df.columns:
+            df['channel'] = np.where(df['Type'].astype(str).str.lower().str.strip().isin(['takeaway', 'afhaal', 'emporter']), 'Takeaway', 'In-Restaurant')
+        else:
+            df['channel'] = 'In-Restaurant'
+            
+    unique_dates = df[date_col].dropna().unique()
+    parsed_dates = pd.to_datetime(pd.Series(unique_dates), dayfirst=True, errors='coerce')
+    date_map = dict(zip(unique_dates, parsed_dates))
+    df['order_timestamp'] = df[date_col].map(date_map)
+    
+    df['time_of_day'] = 'Lunch'
+    df.loc[df['order_timestamp'].dt.hour >= 16, 'time_of_day'] = 'Dinner'
+    df.loc[df['order_timestamp'].isna(), 'time_of_day'] = 'Unknown'
+
+    df['source']        = f'Lightspeed {version}'
+    df['receipt_total'] = pd.to_numeric(df[gross_col], errors='coerce').fillna(0) if gross_col else 0.0
 
     has_tax_col = tax_col in df.columns
     has_vat     = has_tax_col and df[tax_col].astype(str).str.contains(tax_sep).any()
 
     if has_vat:
-        # ✅ FIX: Ontdubbeling (Drop Duplicates) VOORDAT we de berekeningen starten om geheugencrash te voorkomen
         base = df[['order_id','source','channel','order_timestamp','time_of_day', 'receipt_total', tax_col]].copy()
-        base = base.drop_duplicates(subset=['order_id'])
         
         vat_df = base.copy()
         vat_df['vat_parts'] = vat_df[tax_col].astype(str).str.split('|')
@@ -144,7 +152,6 @@ def process_lightspeed(df):
 
         return final_df.reset_index(drop=True)
     else:
-        df = df.drop_duplicates(subset=['order_id'])
         net_col   = next((c for c in ['Net Total','Total excl. Tax'] if c in df.columns), None)
         df['gross_sales'] = df['receipt_total']
         df['net_sales']   = pd.to_numeric(df[net_col],   errors='coerce').fillna(0) if net_col else 0.0
@@ -153,6 +160,10 @@ def process_lightspeed(df):
         df['commission_ex_vat'] = 0.0
         return df[['order_id','source','channel','order_timestamp','time_of_day',
                    'vat_rate','net_sales','tax','gross_sales','commission_ex_vat']].reset_index(drop=True)
+
+def get_time_of_day_simple(hour):
+    if pd.isna(hour): return 'Unknown'
+    return 'Lunch' if hour < 16 else 'Dinner'
     
 def process_ubereats(df):
     first_row_vals = df.iloc[0].astype(str).str.strip().values
@@ -183,7 +194,7 @@ def process_ubereats(df):
         time_str = str(r.get('Order confirmed time', '')).strip()
         
         timestamp = pd.to_datetime(date_str + ' ' + time_str, dayfirst=True, errors='coerce')
-        time_of_day = get_time_of_day(timestamp.hour if pd.notnull(timestamp) else None)
+        time_of_day = get_time_of_day_simple(timestamp.hour if pd.notnull(timestamp) else None)
         
         date_suffix = timestamp.strftime('%Y%m%d') if pd.notnull(timestamp) else "Unknown"
         order_id = f"UE_{order_val}_{date_suffix}"
@@ -278,7 +289,10 @@ def process_deliveroo(df):
     date_str = df['order_timestamp'].dt.strftime('%Y%m%d').fillna('Unknown')
     df['order_id'] = 'DL_' + df['Order number'].astype(str) + '_' + date_str
 
-    df['time_of_day'] = df['order_timestamp'].dt.hour.apply(get_time_of_day)
+    df['time_of_day'] = 'Lunch'
+    df.loc[df['order_timestamp'].dt.hour >= 16, 'time_of_day'] = 'Dinner'
+    df.loc[df['order_timestamp'].isna(), 'time_of_day'] = 'Unknown'
+
     df['gross_sales'] = pd.to_numeric(df['Subtotal'], errors='coerce').fillna(0)
     df['net_sales'] = (df['gross_sales'] / 1.06).round(2)
     df['tax'] = df['gross_sales'] - df['net_sales']
@@ -303,12 +317,15 @@ def process_takeaway(df):
     df['order_id'] = 'TA_' + df[order_col].astype(str) + '_' + date_str
     
     if pickup_col in df.columns:
-        df['channel'] = df[pickup_col].apply(lambda x: 'Takeaway' if str(x).strip().lower() == 'yes' else 'Delivery')
+        df['channel'] = np.where(df[pickup_col].astype(str).str.strip().str.lower() == 'yes', 'Takeaway', 'Delivery')
     else:
         df['channel'] = 'Delivery'
         
     df['source'] = 'Takeaway'
-    df['time_of_day'] = df['order_timestamp'].dt.hour.apply(get_time_of_day)
+    
+    df['time_of_day'] = 'Lunch'
+    df.loc[df['order_timestamp'].dt.hour >= 16, 'time_of_day'] = 'Dinner'
+    df.loc[df['order_timestamp'].isna(), 'time_of_day'] = 'Unknown'
     
     if df[total_col].dtype == object:
         df[total_col] = df[total_col].str.replace(',', '.')
@@ -359,7 +376,8 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
     if new_df.empty:
         return 0, skipped
 
-    new_df = new_df.astype(object).where(pd.notna(new_df), None)
+    new_df['order_timestamp'] = new_df['order_timestamp'].astype(object).where(new_df['order_timestamp'].notna(), None)
+    new_df = new_df.replace({np.nan: None})
 
     records    = new_df.to_dict(orient="records")
     chunk_size = 500  
@@ -440,7 +458,6 @@ if st.sidebar.button("Process File(s)"):
             for file in uploaded_files:
                 raw = file.read()
                 try:
-                    # ✅ FIX: Razendsnelle detectie van seperators bespaart tientallen MB's werkgeheugen
                     first_line = raw[:1024].decode('utf-8', errors='ignore').split('\n')[0]
                     detected_sep = ';' if first_line.count(';') > first_line.count(',') else ','
                     
