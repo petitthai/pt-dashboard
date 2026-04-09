@@ -249,10 +249,10 @@ def process_deliveroo(df):
     df['channel'] = 'Delivery'
     df['source'] = 'Deliveroo'
 
+    # ✅ FIX: Deliveroo exports in YYYY-MM-DD, so no dayfirst=True here!
     df['order_timestamp'] = pd.to_datetime(
         df['Date submitted'].astype(str) + ' ' + df['Time submitted'].astype(str),
-        errors='coerce',
-        dayfirst=True
+        errors='coerce'
     )
 
     date_str = df['order_timestamp'].dt.strftime('%Y%m%d').fillna('Unknown')
@@ -332,7 +332,6 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
     if new_df.empty:
         return 0, skipped
 
-    # ✅ ANTI-CRASH FIX: Vervang NaN/NaT door None, anders crasht PostgreSQL (DataError)!
     new_df = new_df.astype(object).where(pd.notna(new_df), None)
 
     records    = new_df.to_dict(orient="records")
