@@ -451,50 +451,59 @@ uploaded_files = st.sidebar.file_uploader("Upload CSV", type=["csv"], accept_mul
 if st.sidebar.button("Process File(s)"):
     if uploaded_files:
         all_clean_dfs = []
+        total_files = len(uploaded_files)
         
-        with st.spinner("Parsing files (Memory Optimized)..."):
-            for file in uploaded_files:
-                try:
-                    # ✅ ULTIEME RAM-BESPARING:
-                    # Lees enkel de eerste 2048 bytes voor de separator-check.
-                    header_bytes = file.read(2048)
-                    first_line = header_bytes.decode('utf-8', errors='ignore').split('\n')[0]
-                    detected_sep = ';' if first_line.count(';') > first_line.count(',') else ','
-                    
-                    # ✅ Spoel de virtuele lezer terug naar het prille begin van het bestand!
-                    file.seek(0)
-                    
-                    # ✅ Laat Pandas RECHTSTREEKS vanaf de upload buffer lezen (voorkomt geheugen crash)
-                    df_raw = pd.read_csv(file, sep=detected_sep, low_memory=False)
-                    
-                    parsers = {
-                        "Lightspeed K-Series": process_lightspeed,
-                        "Lightspeed L-Series": process_lightspeed,
-                        "Uber Eats": process_ubereats,
-                        "Deliveroo": process_deliveroo,
-                        "Takeaway": process_takeaway,
-                    }
-                    
-                    clean_df = parsers[source_option](df_raw)
-                    
-                    # ✅ Verwijder de zware rauwe data direct uit het RAM geheugen!
-                    del df_raw
-                    
-                    if not clean_df.empty:
-                        all_clean_dfs.append(clean_df)
-                except Exception as e:
-                    st.sidebar.error(f"Error parsing file {file.name}: {e}")
+        # ✅ Een dynamisch tekstvak voor live status updates!
+        status_msg = st.sidebar.empty()
+        
+        for i, file in enumerate(uploaded_files):
+            try:
+                status_msg.info(f"⏳ Bestand {i+1}/{total_files}: Structuur van '{file.name}' analyseren...")
+                
+                # Lees enkel de eerste 2048 bytes voor de separator-check.
+                header_bytes = file.read(2048)
+                first_line = header_bytes.decode('utf-8', errors='ignore').split('\n')[0]
+                detected_sep = ';' if first_line.count(';') > first_line.count(',') else ','
+                
+                # Spoel de virtuele lezer terug naar het prille begin van het bestand
+                file.seek(0)
+                
+                status_msg.info(f"📥 Bestand {i+1}/{total_files}: Rauwe data inladen (geheugen-geoptimaliseerd)...")
+                df_raw = pd.read_csv(file, sep=detected_sep, low_memory=False)
+                
+                parsers = {
+                    "Lightspeed K-Series": process_lightspeed,
+                    "Lightspeed L-Series": process_lightspeed,
+                    "Uber Eats": process_ubereats,
+                    "Deliveroo": process_deliveroo,
+                    "Takeaway": process_takeaway,
+                }
+                
+                status_msg.info(f"⚙️ Bestand {i+1}/{total_files}: Btw-tarieven berekenen en formatteren voor {source_option}...")
+                clean_df = parsers[source_option](df_raw)
+                
+                # Verwijder de zware rauwe data direct uit het RAM geheugen!
+                del df_raw
+                
+                if not clean_df.empty:
+                    all_clean_dfs.append(clean_df)
+            except Exception as e:
+                st.sidebar.error(f"Fout bij verwerken van {file.name}: {e}")
 
         if not all_clean_dfs:
-            st.session_state['import_msg'] = "⚠️ No valid or completed orders found in these files."
+            st.session_state['import_msg'] = "⚠️ Geen geldige of voltooide orders gevonden in deze bestanden."
+            status_msg.empty()
         else:
+            status_msg.info("🗄️ Alle bestanden verwerkt! Klaarmaken voor database import...")
             combined_df = pd.concat(all_clean_dfs, ignore_index=True)
-            progress = st.sidebar.progress(0, text="Checking database for duplicates...")
+            
+            progress = st.sidebar.progress(0, text="Database controleren op dubbele orders...")
             inserted, skipped = save_to_db_with_progress(combined_df, progress)
             progress.empty()
+            status_msg.empty()
 
             st.session_state['import_msg'] = (
-                f"✅ Import successful: {inserted} new rows added, {skipped} duplicates skipped."
+                f"✅ Import succesvol: {inserted} nieuwe rijen toegevoegd, {skipped} dubbels overgeslagen."
             )
             
         st.cache_data.clear()
