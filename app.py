@@ -40,7 +40,6 @@ def get_time_of_day(hour):
     if pd.isna(hour): return 'Unknown'
     return 'Lunch' if hour < 16 else 'Dinner'
 
-# ✅ FIX 2: Removed unused version parameter, relies 100% on auto-detect
 def process_lightspeed(df):
     df.columns = df.columns.astype(str).str.strip()
 
@@ -49,20 +48,29 @@ def process_lightspeed(df):
 
     if is_kseries:
         if 'Type' in df.columns:
-            df = df[df['Type'].astype(str).str.strip() == 'SALE'].copy()
+            valid_types = ['SALE', 'Sale', 'Verkoop', 'Vente']
+            df = df[df['Type'].astype(str).str.strip().isin(valid_types)].copy()
         if 'Canceled' in df.columns:
-            df = df[df['Canceled'].astype(str).str.strip() == 'No'].copy()
+            valid_cancels = ['No', 'Nee', 'Non', 'False']
+            df = df[df['Canceled'].astype(str).str.strip().isin(valid_cancels)].copy()
         receipt_col = 'Identifier'
         tax_col     = 'TaxName'      
         tax_sep     = ':'            
         rate_prefix = 'BTW '        
     else:
         if 'Status' in df.columns:
-            df = df[df['Status'].astype(str).str.strip().isin(['Paid', 'Done'])].copy()
+            # ✅ Extra beveiliging voor NL/FR exports van Lightspeed
+            valid_statuses = ['Paid', 'Done', 'Betaald', 'Afgerekend', 'Payé', 'Terminé', 'Voltooid']
+            df = df[df['Status'].astype(str).str.strip().isin(valid_statuses)].copy()
         receipt_col = 'Receipt ID' if 'Receipt ID' in df.columns else df.columns[0]
         tax_col     = 'Taxes'        
         tax_sep     = '='
         rate_prefix = ''
+
+    if df.empty or receipt_col not in df.columns:
+        return pd.DataFrame()
+
+    df = df.dropna(subset=[receipt_col])
 
     date_col = next(
         (c for c in ['Finalized Date', 'Creation Date', 'Date'] if c in df.columns),
@@ -72,14 +80,13 @@ def process_lightspeed(df):
 
     df['order_id']        = f'LS_{version}_' + df[receipt_col].astype(str)
     
-    # ✅ FIX 3: Correct channel detection for K-Series vs L-Series
     if is_kseries:
         df['channel'] = df['Mode'].apply(
-            lambda x: 'Takeaway' if str(x).lower() in ['takeout', 'takeaway', 'take-away'] else 'In-Restaurant'
+            lambda x: 'Takeaway' if str(x).lower() in ['takeout', 'takeaway', 'take-away', 'afhaal', 'emporter'] else 'In-Restaurant'
         ) if 'Mode' in df.columns else 'In-Restaurant'
     else:
         df['channel'] = df['Type'].apply(
-            lambda x: 'Takeaway' if str(x).lower() == 'takeaway' else 'In-Restaurant'
+            lambda x: 'Takeaway' if str(x).lower() in ['takeaway', 'afhaal', 'emporter'] else 'In-Restaurant'
         ) if 'Type' in df.columns else 'In-Restaurant'
         
     df['order_timestamp'] = pd.to_datetime(df[date_col], dayfirst=True, errors='coerce')
@@ -91,10 +98,12 @@ def process_lightspeed(df):
     has_vat     = has_tax_col and df[tax_col].astype(str).str.contains(tax_sep).any()
 
     if has_vat:
-        base = df[['order_id','source','channel','order_timestamp','time_of_day', 'receipt_total']].copy()
+        # ✅ FIX: Ontdubbeling (Drop Duplicates) VOORDAT we de berekeningen starten om geheugencrash te voorkomen
+        base = df[['order_id','source','channel','order_timestamp','time_of_day', 'receipt_total', tax_col]].copy()
+        base = base.drop_duplicates(subset=['order_id'])
         
         vat_df = base.copy()
-        vat_df['vat_parts'] = df[tax_col].astype(str).str.split('|')
+        vat_df['vat_parts'] = vat_df[tax_col].astype(str).str.split('|')
         exploded = vat_df.explode('vat_parts')
         exploded = exploded[exploded['vat_parts'].str.contains(tax_sep, na=False)].copy()
 
@@ -135,6 +144,7 @@ def process_lightspeed(df):
 
         return final_df.reset_index(drop=True)
     else:
+        df = df.drop_duplicates(subset=['order_id'])
         net_col   = next((c for c in ['Net Total','Total excl. Tax'] if c in df.columns), None)
         df['gross_sales'] = df['receipt_total']
         df['net_sales']   = pd.to_numeric(df[net_col],   errors='coerce').fillna(0) if net_col else 0.0
@@ -308,7 +318,6 @@ def process_takeaway(df):
     df['tax'] = df['gross_sales'] - df['net_sales']
     df['vat_rate'] = '6%'
     
-    # Intentionally kept at 30% as per user request
     df['commission_ex_vat'] = (df['gross_sales'] * 0.30).round(2)
     
     return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales','commission_ex_vat']]
@@ -320,7 +329,6 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
     if progress_bar:
         progress_bar.progress(0.05, text="Checking database for existing records...")
 
-    # ✅ FIX 1: Restored WHERE clause to prevent full table downloads
     sources = clean_df['source'].unique().tolist()
     placeholders = ', '.join(f':s{i}' for i in range(len(sources)))
     params = {f's{i}': s for i, s in enumerate(sources)}
@@ -432,7 +440,11 @@ if st.sidebar.button("Process File(s)"):
             for file in uploaded_files:
                 raw = file.read()
                 try:
-                    df_raw = pd.read_csv(io.BytesIO(raw), sep=None, engine='python')
+                    # ✅ FIX: Razendsnelle detectie van seperators bespaart tientallen MB's werkgeheugen
+                    first_line = raw[:1024].decode('utf-8', errors='ignore').split('\n')[0]
+                    detected_sep = ';' if first_line.count(';') > first_line.count(',') else ','
+                    
+                    df_raw = pd.read_csv(io.BytesIO(raw), sep=detected_sep, low_memory=False)
                     
                     parsers = {
                         "Lightspeed K-Series": process_lightspeed,
@@ -481,7 +493,6 @@ if st.sidebar.button("🧹 Clean Database"):
     with st.spinner("Cleaning database thoroughly..."):
         try:
             with engine.begin() as conn:
-                # Still relevant because user uploaded K-series orders as L-series historically
                 result_fout = conn.execute(text("""
                     DELETE FROM sales 
                     WHERE source = 'Lightspeed L-Series' 
@@ -584,7 +595,6 @@ with tab_vat:
     if vat_data.empty:
         st.info("No data in the report yet.")
     else:
-        # ✅ FIX 9: Translating string to English
         quarters_list = [str(q) for q in vat_data['quarter'].unique() if str(q) not in ['NaT', 'nan', 'None']]
         quarters = sorted(quarters_list, reverse=True)
         
