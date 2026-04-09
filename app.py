@@ -71,7 +71,7 @@ def process_lightspeed(df, version="K-Series"):
 
     df['order_id']        = f'LS_{version}_' + df[receipt_col].astype(str)
     df['channel']         = df['Type'].apply(lambda x: 'Takeaway' if str(x).lower()=='takeaway' else 'In-Restaurant') if 'Type' in df.columns else 'In-Restaurant'
-    df['order_timestamp'] = pd.to_datetime(df[date_col], dayfirst=True)
+    df['order_timestamp'] = pd.to_datetime(df[date_col], dayfirst=True, errors='coerce')
     df['time_of_day']     = df['order_timestamp'].dt.hour.apply(get_time_of_day)
     df['source']          = f'Lightspeed {version}'
     df['receipt_total']   = pd.to_numeric(df[gross_col], errors='coerce').fillna(0) if gross_col else 0.0
@@ -255,7 +255,6 @@ def process_deliveroo(df):
         dayfirst=True
     )
 
-    # ✅ FIX: Voeg datum toe aan Deliveroo ID's (vermijdt dubbels bij hergebruik van de dagelijkse 4-cijferige codes)
     date_str = df['order_timestamp'].dt.strftime('%Y%m%d').fillna('Unknown')
     df['order_id'] = 'DL_' + df['Order number'].astype(str) + '_' + date_str
 
@@ -332,6 +331,9 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
 
     if new_df.empty:
         return 0, skipped
+
+    # ✅ ANTI-CRASH FIX: Vervang NaN/NaT door None, anders crasht PostgreSQL (DataError)!
+    new_df = new_df.astype(object).where(pd.notna(new_df), None)
 
     records    = new_df.to_dict(orient="records")
     chunk_size = 500  
