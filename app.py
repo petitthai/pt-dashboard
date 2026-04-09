@@ -535,4 +535,4 @@ with tab_dash:
             view = st.radio("View", ["Weekly","Monthly"], horizontal=True)
             grp_col = 'week_str' if view == 'Weekly' else 'month'
             trend = dash_data.groupby([grp_col,'year'])['gross_sales'].sum().reset_index()
-            if not trend.empty
+            if not trend.empty:
