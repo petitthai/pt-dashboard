@@ -28,7 +28,6 @@ def init_db():
                 gross_sales DOUBLE PRECISION
             )
         '''))
-        # Regular index for fast duplicate pre-filtering — not unique
         conn.execute(text('''
             CREATE INDEX IF NOT EXISTS idx_sales_source_order_vat
                 ON sales(source, order_id, vat_rate)
@@ -41,8 +40,11 @@ def get_time_of_day(hour):
 def process_lightspeed(df, version="K-Series"):
     df.columns = df.columns.astype(str).str.strip()
 
-    # ── Detect format: K-series (Identifier col) vs L-series (Receipt ID col) ──
+    # ── Detect format: K-series heeft 'Identifier', L-series niet ──
     is_kseries = 'Identifier' in df.columns
+
+    # ✅ AUTO-CORRECTIE: Forceer de juiste versie op basis van het bestand, ongeacht de dropdown keuze!
+    version = "K-Series" if is_kseries else "L-Series"
 
     if is_kseries:
         if 'Type' in df.columns:
@@ -118,7 +120,6 @@ def process_ubereats(df):
     df = df[df['Order status'].astype(str).str.strip() == 'Completed'].copy()
     
     rows = []
-    
     VAT_RATE_MAP = {
         'VAT 1 on sales': '6%',
         'VAT 2 on sales': '21%',
@@ -239,7 +240,7 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
     placeholders = ', '.join(f':s{i}' for i in range(len(sources)))
 
     if progress_bar:
-        progress_bar.progress(0.05, text="Checking database for existing records...")
+        progress_bar.progress(0.05, text="Controleren op bestaande data in de database...")
 
     with engine.connect() as conn:
         result = conn.execute(
@@ -261,7 +262,7 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
     skipped  = len(clean_df) - len(new_df)
 
     if progress_bar:
-        progress_bar.progress(0.2, text=f"Found {len(new_df)} new rows to insert ({skipped} duplicates skipped)...")
+        progress_bar.progress(0.2, text=f"Gevonden: {len(new_df)} nieuwe rijen ({skipped} dubbels overgeslagen)...")
 
     if new_df.empty:
         return 0, skipped
@@ -287,7 +288,7 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
         if progress_bar:
             progress_bar.progress(
                 0.2 + 0.8 * min((i + chunk_size) / total, 1.0),
-                text=f"Inserting... {min(i + chunk_size, total)}/{total} rows"
+                text=f"Database bijwerken... {min(i + chunk_size, total)}/{total} rijen toegevoegd"
             )
 
     return inserted, skipped
@@ -319,7 +320,7 @@ msg_placeholder = st.sidebar.empty()
 if 'import_msg' in st.session_state:
     msg_placeholder.success(st.session_state.pop('import_msg'))
 
-with st.sidebar.expander("How to update", expanded=True):
+with st.sidebar.expander("Hoe updaten?", expanded=True):
     st.markdown("""
 - **K-Series:** Backoffice → Reports → Receipts → Export CSV  
 - **Uber Eats:** UE Manager → Payments → Invoices → Export CSV  
@@ -327,10 +328,10 @@ with st.sidebar.expander("How to update", expanded=True):
 - **Takeaway:** Portal → Invoicing → Orders → Export CSV
     """)
 
-source_option = st.sidebar.selectbox("Source", ["Lightspeed K-Series","Lightspeed L-Series","Deliveroo","Uber Eats","Takeaway"])
+source_option = st.sidebar.selectbox("Bronbestand", ["Lightspeed K-Series","Lightspeed L-Series","Deliveroo","Uber Eats","Takeaway"])
 uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
 
-if st.sidebar.button("Process File"):
+if st.sidebar.button("Verwerk Bestand"):
     if uploaded_file:
         raw = uploaded_file.read()
         try:
@@ -344,87 +345,97 @@ if st.sidebar.button("Process File"):
                 "Takeaway": process_takeaway,
             }
 
-            with st.spinner("Parsing file..."):
+            with st.spinner("Bestand analyseren..."):
                 clean_df = parsers[source_option](df_raw)
 
             if clean_df.empty:
-                st.session_state['import_msg'] = "⚠️ No valid completed orders found in this file."
+                st.session_state['import_msg'] = "⚠️ Geen nieuwe of voltooide bestellingen gevonden in dit bestand."
             else:
-                progress = st.sidebar.progress(0, text="Checking database for duplicates...")
+                progress = st.sidebar.progress(0, text="Zoeken naar dubbele orders...")
                 inserted, skipped = save_to_db_with_progress(clean_df, progress)
                 progress.empty()
 
                 st.session_state['import_msg'] = (
-                    f"✅ Import completed: {inserted} rows added, {skipped} duplicates skipped."
+                    f"✅ Import geslaagd: {inserted} nieuwe rijen toegevoegd, {skipped} dubbele overgeslagen."
                 )
                 
             st.cache_data.clear()
             st.rerun()
             
         except Exception as e:
-            st.sidebar.error(f"Error parsing file: {e}")
+            st.sidebar.error(f"Fout bij inlezen van bestand: {e}")
 
 data = load_data(full_history=False)
 
 if not data.empty:
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**📅 Data currently in DB:**")
+    st.sidebar.markdown("**📅 Data momenteel in DB:**")
     summary_dates = data.groupby('source')['order_timestamp'].agg(['min', 'max']).reset_index()
     for _, row in summary_dates.iterrows():
         src = row['source']
         min_date = row['min'].date()
         max_date = row['max'].date()
-        st.sidebar.caption(f"**{src}**\n{min_date} to {max_date}")
+        st.sidebar.caption(f"**{src}**\n{min_date} tot {max_date}")
     st.sidebar.markdown("---")
 
-st.sidebar.subheader("Maintenance")
+st.sidebar.subheader("Onderhoud")
 if st.sidebar.button("🧹 Clean Database"):
-    try:
-        with engine.begin() as conn:
-            count_before = conn.execute(text("SELECT COUNT(*) FROM sales")).scalar()
-            
-            # ✅ SLIMME SCHOONMAAK: Kijkt door K-Series en L-Series fouten heen!
-            # Vervangt intern 'LS_K-Series_' en 'LS_L-Series_' door 'LS_' om de echte dubbels te vinden.
-            conn.execute(text("""
-                DELETE FROM sales
-                WHERE id IN (
-                    SELECT id FROM (
-                        SELECT id, ROW_NUMBER() OVER(
-                            PARTITION BY 
-                                REPLACE(REPLACE(order_id, 'LS_K-Series_', 'LS_'), 'LS_L-Series_', 'LS_'), 
-                                vat_rate 
-                            ORDER BY id
-                        ) as row_num
-                        FROM sales
-                    ) t WHERE t.row_num > 1
-                )
-            """))
-            
-            count_after = conn.execute(text("SELECT COUNT(*) FROM sales")).scalar()
-            removed = count_before - count_after
-            if removed > 0:
-                st.session_state['import_msg'] = f"✅ Cleaned! Removed {removed} cross-source duplicate rows."
-            else:
-                st.session_state['import_msg'] = "Database is already clean! No duplicates found."
+    with st.spinner("Database wordt grondig schoongemaakt..."):
+        try:
+            with engine.begin() as conn:
+                # ✅ STAP 1: Verwijder de "K-Series in schaapskleren"
+                # Als het order_id in L-Series zit, maar het begint met de letter R, moet het weg!
+                result_fout = conn.execute(text("""
+                    DELETE FROM sales 
+                    WHERE source = 'Lightspeed L-Series' 
+                    AND order_id LIKE 'LS_L-Series_R%'
+                """))
+                foute_verwijderd = result_fout.rowcount
+
+                # ✅ STAP 2: Standaard check voor exacte dubbele rijen
+                count_before = conn.execute(text("SELECT COUNT(*) FROM sales")).scalar()
+                conn.execute(text("""
+                    DELETE FROM sales
+                    WHERE id IN (
+                        SELECT id FROM (
+                            SELECT id, ROW_NUMBER() OVER(
+                                PARTITION BY order_id, vat_rate 
+                                ORDER BY id ASC
+                            ) as row_num
+                            FROM sales
+                        ) t WHERE t.row_num > 1
+                    )
+                """))
+                count_after = conn.execute(text("SELECT COUNT(*) FROM sales")).scalar()
+                dubbels_verwijderd = count_before - count_after
+                
+                totaal_verwijderd = foute_verwijderd + dubbels_verwijderd
+                
+                if totaal_verwijderd > 0:
+                    st.session_state['import_msg'] = f"✅ Opgeschoond! {foute_verwijderd} foute L-Series verwijderd en {dubbels_verwijderd} dubbele rijen gewist."
+                else:
+                    st.session_state['import_msg'] = "Database is al helemaal schoon! Geen foute formaten of dubbels gevonden."
+                    
             st.cache_data.clear()
             st.rerun()
-    except Exception as e:
-        st.sidebar.error(f"Error cleaning DB: {e}")
+            
+        except Exception as e:
+            st.sidebar.error(f"Fout bij schoonmaken: {e}")
 
-tab_dash, tab_vat = st.tabs(["Management Dashboard", "VAT Report"])
+tab_dash, tab_vat = st.tabs(["Management Dashboard", "Btw Rapportage (VAT)"])
 
 with tab_dash:
     st.header("Management Dashboard")
     if data.empty:
-        st.info("No data yet — upload a CSV from the sidebar.")
+        st.info("Nog geen data in het systeem — upload een CSV via het menu links.")
     else:
         min_date_db = data['order_date'].min()
         max_date_db = data['order_date'].max()
         
-        date_range = st.date_input("Filter Dashboard Date Range", [min_date_db, max_date_db], min_value=min_date_db, max_value=max_date_db)
+        date_range = st.date_input("Filter Dashboard Periode", [min_date_db, max_date_db], min_value=min_date_db, max_value=max_date_db)
         
         if len(date_range) != 2:
-            st.warning("Please select both a start and end date to view the dashboard.")
+            st.warning("Selecteer aub een start- en einddatum om het dashboard te zien.")
             st.stop()
             
         dash_data = data[(data['order_date'] >= date_range[0]) & (data['order_date'] <= date_range[1])]
@@ -435,77 +446,76 @@ with tab_dash:
         dinner = dash_data[dash_data['time_of_day']=='Dinner']['gross_sales'].sum()
 
         c1,c2,c3,c4 = st.columns(4)
-        c1.metric("Total revenue", f"€{total:,.2f}")
-        c2.metric("Avg per open day", f"€{total/days:,.2f}")
+        c1.metric("Totale Omzet", f"€{total:,.2f}")
+        c2.metric("Gem. per geopende dag", f"€{total/days:,.2f}")
         c3.metric("Lunch", f"€{lunch:,.2f}", f"{lunch/total*100:.1f}%" if total else "")
-        c4.metric("Dinner", f"€{dinner:,.2f}", f"{dinner/total*100:.1f}%" if total else "")
+        c4.metric("Diner", f"€{dinner:,.2f}", f"{dinner/total*100:.1f}%" if total else "")
 
         st.divider()
         col1, col2 = st.columns(2)
 
         with col1:
-            view = st.radio("Trend view", ["Weekly","Monthly"], horizontal=True)
-            grp_col = 'week_str' if view == 'Weekly' else 'month'
+            view = st.radio("Weergave", ["Wekelijks","Maandelijks"], horizontal=True)
+            grp_col = 'week_str' if view == 'Wekelijks' else 'month'
             trend = dash_data.groupby([grp_col,'year'])['gross_sales'].sum().reset_index()
             if not trend.empty:
-                fig = px.bar(trend, x=grp_col, y='gross_sales', color='year', barmode='group')
+                fig = px.bar(trend, x=grp_col, y='gross_sales', color='year', barmode='group', title="Omzet Trend")
                 st.plotly_chart(fig, use_container_width=True)
 
         with col2:
             by_channel = dash_data.groupby('channel')['gross_sales'].sum().reset_index()
             if not by_channel.empty:
-                fig2 = px.pie(by_channel, values='gross_sales', names='channel', hole=0.4)
+                fig2 = px.pie(by_channel, values='gross_sales', names='channel', hole=0.4, title="Verdeling per Kanaal")
                 st.plotly_chart(fig2, use_container_width=True)
 
         by_src = dash_data.groupby(['source','time_of_day'])['gross_sales'].sum().reset_index()
         if not by_src.empty:
-            fig3 = px.bar(by_src, x='source', y='gross_sales', color='time_of_day')
+            fig3 = px.bar(by_src, x='source', y='gross_sales', color='time_of_day', title="Verdeling Bron vs Moment (Lunch/Diner)")
             st.plotly_chart(fig3, use_container_width=True)
 
 with tab_vat:
-    st.header("VAT Report")
+    st.header("Btw Rapportage (VAT)")
     
     vat_data = load_data(full_history=True)
     
     if vat_data.empty:
-        st.info("No data yet.")
+        st.info("Nog geen data in de rapportage.")
     else:
         quarters = sorted(vat_data['quarter'].unique(), reverse=True)
-        selected_q = st.selectbox("Quarter", quarters)
+        selected_q = st.selectbox("Selecteer Kwartaal", quarters)
         q_data = vat_data[vat_data['quarter'] == selected_q]
 
         summary = q_data.groupby(['source','vat_rate'])[['net_sales','tax','gross_sales']].sum().reset_index()
-        summary.columns = ['Source', 'VAT rate', 'Net', 'VAT', 'Gross']
+        summary.columns = ['Bron', 'Btw-tarief', 'Netto', 'Btw-bedrag', 'Bruto']
 
         totals = pd.DataFrame([{
-            'Source': 'TOTAL', 'VAT rate': '',
-            'Net': summary['Net'].sum(),
-            'VAT': summary['VAT'].sum(),
-            'Gross': summary['Gross'].sum()
+            'Bron': 'TOTAAL', 'Btw-tarief': '',
+            'Netto': summary['Netto'].sum(),
+            'Btw-bedrag': summary['Btw-bedrag'].sum(),
+            'Bruto': summary['Bruto'].sum()
         }])
         
         st.subheader("Overzicht per bron")
         st.dataframe(
             pd.concat([summary, totals], ignore_index=True)
-              .style.format({'Net': '€{:.2f}', 'VAT': '€{:.2f}', 'Gross': '€{:.2f}'}),
+              .style.format({'Netto': '€{:.2f}', 'Btw-bedrag': '€{:.2f}', 'Bruto': '€{:.2f}'}),
             use_container_width=True
         )
         
-        # ✅ VAT EXPORT TOEVOEGING: Toon ook de losse transacties in de app
         with st.expander("Toon alle individuele transacties (inclusief Order ID)"):
             st.dataframe(
                 q_data[['order_id', 'source', 'channel', 'order_timestamp', 'time_of_day', 'vat_rate', 'net_sales', 'tax', 'gross_sales']],
                 use_container_width=True
             )
 
-        if st.button("Export to Excel"):
+        if st.button("Exporteer naar Excel"):
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                summary.to_excel(writer, sheet_name='Summary', index=False)
-                # De Excel export bevat ALTIJD al de order_id in het tweede tabblad!
+                summary.to_excel(writer, sheet_name='1. Samenvatting', index=False)
                 q_data[['order_id','source','channel','order_timestamp',
                          'time_of_day','vat_rate','net_sales','tax','gross_sales']]\
-                    .to_excel(writer, sheet_name='Transactions', index=False)
-            st.download_button("Download Excel", output.getvalue(),
-                file_name=f"VAT_{selected_q}.xlsx",
+                    .to_excel(writer, sheet_name='2. Alle_Transacties_Details', index=False)
+                    
+            st.download_button("📥 Download Excel Bestand", output.getvalue(),
+                file_name=f"Btw_Rapportage_{selected_q}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
