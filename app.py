@@ -69,8 +69,7 @@ def process_lightspeed(df):
 
     df = df.dropna(subset=[receipt_col])
     
-    # 🔥 ULTIEME MEMORY FIX: Gooi L-Series dubbels (lijn-niveau) direct weg aan het begin! 
-    # Dit voorkomt dat we datums en labels berekenen voor 50.000 rijen als er maar 10.000 bonnetjes zijn.
+    # 🔥 MEMORY FIX: Gooi L-Series dubbels (lijn-niveau) direct weg! 
     df = df.drop_duplicates(subset=[receipt_col]).copy()
 
     date_col = next(
@@ -376,8 +375,7 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
     if new_df.empty:
         return 0, skipped
 
-    new_df['order_timestamp'] = new_df['order_timestamp'].astype(object).where(new_df['order_timestamp'].notna(), None)
-    new_df = new_df.replace({np.nan: None})
+    new_df = new_df.astype(object).where(pd.notna(new_df), None)
 
     records    = new_df.to_dict(orient="records")
     chunk_size = 500  
@@ -454,14 +452,20 @@ if st.sidebar.button("Process File(s)"):
     if uploaded_files:
         all_clean_dfs = []
         
-        with st.spinner("Parsing files..."):
+        with st.spinner("Parsing files (Memory Optimized)..."):
             for file in uploaded_files:
-                raw = file.read()
                 try:
-                    first_line = raw[:1024].decode('utf-8', errors='ignore').split('\n')[0]
+                    # ✅ ULTIEME RAM-BESPARING:
+                    # Lees enkel de eerste 2048 bytes voor de separator-check.
+                    header_bytes = file.read(2048)
+                    first_line = header_bytes.decode('utf-8', errors='ignore').split('\n')[0]
                     detected_sep = ';' if first_line.count(';') > first_line.count(',') else ','
                     
-                    df_raw = pd.read_csv(io.BytesIO(raw), sep=detected_sep, low_memory=False)
+                    # ✅ Spoel de virtuele lezer terug naar het prille begin van het bestand!
+                    file.seek(0)
+                    
+                    # ✅ Laat Pandas RECHTSTREEKS vanaf de upload buffer lezen (voorkomt geheugen crash)
+                    df_raw = pd.read_csv(file, sep=detected_sep, low_memory=False)
                     
                     parsers = {
                         "Lightspeed K-Series": process_lightspeed,
@@ -472,6 +476,10 @@ if st.sidebar.button("Process File(s)"):
                     }
                     
                     clean_df = parsers[source_option](df_raw)
+                    
+                    # ✅ Verwijder de zware rauwe data direct uit het RAM geheugen!
+                    del df_raw
+                    
                     if not clean_df.empty:
                         all_clean_dfs.append(clean_df)
                 except Exception as e:
