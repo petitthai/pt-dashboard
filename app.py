@@ -536,3 +536,82 @@ with tab_dash:
             grp_col = 'week_str' if view == 'Weekly' else 'month'
             trend = dash_data.groupby([grp_col,'year'])['gross_sales'].sum().reset_index()
             if not trend.empty:
+                fig = px.bar(trend, x=grp_col, y='gross_sales', color='year', barmode='group', title="Revenue Trend")
+                st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            by_channel = dash_data.groupby('channel')['gross_sales'].sum().reset_index()
+            if not by_channel.empty:
+                fig2 = px.pie(by_channel, values='gross_sales', names='channel', hole=0.4, title="Revenue by Channel")
+                st.plotly_chart(fig2, use_container_width=True)
+
+        by_src = dash_data.groupby(['source','time_of_day'])['gross_sales'].sum().reset_index()
+        if not by_src.empty:
+            fig3 = px.bar(by_src, x='source', y='gross_sales', color='time_of_day', title="Revenue by Source & Time of Day")
+            st.plotly_chart(fig3, use_container_width=True)
+
+with tab_vat:
+    st.header("VAT Report")
+    
+    vat_data = load_data(full_history=True)
+    
+    if vat_data.empty:
+        st.info("No data in the report yet.")
+    else:
+        quarters = sorted(vat_data['quarter'].unique(), reverse=True)
+        selected_q = st.selectbox("Select Quarter", quarters)
+        q_data = vat_data[vat_data['quarter'] == selected_q]
+
+        if 'commission_ex_vat' in q_data.columns:
+            summary = q_data.groupby(['source','vat_rate'])[['net_sales','tax','gross_sales', 'commission_ex_vat']].sum().reset_index()
+            summary.columns = ['Source', 'VAT Rate', 'Net', 'VAT', 'Gross', 'Commission (ex VAT)']
+        else:
+            summary = q_data.groupby(['source','vat_rate'])[['net_sales','tax','gross_sales']].sum().reset_index()
+            summary.columns = ['Source', 'VAT Rate', 'Net', 'VAT', 'Gross']
+
+        totals_dict = {
+            'Source': 'TOTAL', 'VAT Rate': '',
+            'Net': summary['Net'].sum(),
+            'VAT': summary['VAT'].sum(),
+            'Gross': summary['Gross'].sum()
+        }
+        if 'Commission (ex VAT)' in summary.columns:
+            totals_dict['Commission (ex VAT)'] = summary['Commission (ex VAT)'].sum()
+            
+        totals = pd.DataFrame([totals_dict])
+        
+        st.subheader("Overview by Source")
+        
+        format_dict = {'Net': '€{:.2f}', 'VAT': '€{:.2f}', 'Gross': '€{:.2f}'}
+        if 'Commission (ex VAT)' in summary.columns:
+            format_dict['Commission (ex VAT)'] = '€{:.2f}'
+            
+        st.dataframe(
+            pd.concat([summary, totals], ignore_index=True)
+              .style.format(format_dict),
+            use_container_width=True
+        )
+        
+        with st.expander("Show all individual transactions (including Order ID)"):
+            cols_to_show = ['order_id', 'source', 'channel', 'order_timestamp', 'time_of_day', 'vat_rate', 'net_sales', 'tax', 'gross_sales']
+            if 'commission_ex_vat' in q_data.columns:
+                cols_to_show.append('commission_ex_vat')
+            st.dataframe(
+                q_data[cols_to_show],
+                use_container_width=True
+            )
+
+        if st.button("Export to Excel"):
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                summary.to_excel(writer, sheet_name='1. Summary', index=False)
+                
+                cols_to_export = ['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']
+                if 'commission_ex_vat' in q_data.columns:
+                    cols_to_export.append('commission_ex_vat')
+                    
+                q_data[cols_to_export].to_excel(writer, sheet_name='2. All_Transactions_Details', index=False)
+                    
+            st.download_button("📥 Download Excel File", output.getvalue(),
+                file_name=f"VAT_Report_{selected_q}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
