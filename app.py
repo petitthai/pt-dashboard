@@ -44,7 +44,7 @@ def process_lightspeed(df):
             df = df[df['Status'].astype(str).str.strip().isin(['Paid', 'Done', 'Betaald', 'Afgerekend', 'Payé', 'Terminé', 'Voltooid'])].copy()
         receipt_col = 'Receipt ID' if 'Receipt ID' in df.columns else df.columns[0]
         tax_col, tax_sep, rate_prefix = 'Taxes', '=', ''
-        vat_sep = ',' # Scheidingsteken voor L-Series BTW
+        vat_sep = '|' # Scheidingsteken voor L-Series BTW
 
     if df.empty or receipt_col not in df.columns: return pd.DataFrame()
     df = df.dropna(subset=[receipt_col])
