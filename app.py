@@ -72,14 +72,12 @@ def process_lightspeed(df):
         base = df[['order_id','source','channel','order_timestamp','time_of_day', 'receipt_total', tax_col]].copy()
         vat_df = base.copy()
         
-        # Splits de BTW-kolom met de juiste separator voor de huidige versie
         vat_df['vat_parts'] = vat_df[tax_col].astype(str).str.split(vat_sep)
         exploded = vat_df.explode('vat_parts')
         
         exploded = exploded[exploded['vat_parts'].str.contains(tax_sep, na=False)].copy()
         split = exploded['vat_parts'].str.strip().str.split(tax_sep, expand=True)
         
-        # Haal het percentage eruit en vervang de prefix (alleen als er een prefix is!)
         rate_str = split[0]
         if rate_prefix:
             rate_str = rate_str.str.replace(rate_prefix, '', regex=False)
@@ -203,7 +201,9 @@ def save_to_db(clean_df, progress_bar=None):
 
     sources = clean_df['source'].unique().tolist()
     params = {f's{i}': s for i, s in enumerate(sources)}
-    placeholders = ', '.join(params.keys())
+    
+    # Fix voor de SQLAlchemy placeholders:
+    placeholders = ', '.join([f":{k}" for k in params.keys()])
 
     with engine.connect() as conn:
         res = conn.execute(text(f"SELECT order_id, vat_rate FROM sales WHERE source IN ({placeholders})"), params)
