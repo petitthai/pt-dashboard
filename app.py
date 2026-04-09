@@ -37,7 +37,7 @@ def init_db():
                 ON sales(source, order_id, vat_rate)
         '''))
 
-# Razendsnelle (gevectoriseerde) Lightspeed verwerking voor reusachtige bestanden
+# Razendsnelle (gevectoriseerde) Lightspeed verwerking
 def process_lightspeed(df):
     df.columns = df.columns.astype(str).str.strip()
 
@@ -67,11 +67,8 @@ def process_lightspeed(df):
     if df.empty or receipt_col not in df.columns:
         return pd.DataFrame()
 
-    df = df.dropna(subset=[receipt_col])
+    df = df.dropna(subset=[receipt_col]).copy()
     
-    # 🔥 MEMORY FIX: Gooi L-Series dubbels (lijn-niveau) direct weg! 
-    df = df.drop_duplicates(subset=[receipt_col]).copy()
-
     date_col = next(
         (c for c in ['Finalized Date', 'Creation Date', 'Date'] if c in df.columns),
         df.columns[1]
@@ -91,11 +88,7 @@ def process_lightspeed(df):
         else:
             df['channel'] = 'In-Restaurant'
             
-    unique_dates = df[date_col].dropna().unique()
-    # Safe date parsing
-    parsed_dates = pd.to_datetime(pd.Series(unique_dates), dayfirst=True, errors='coerce')
-    date_map = dict(zip(unique_dates, parsed_dates))
-    df['order_timestamp'] = df[date_col].map(date_map)
+    df['order_timestamp'] = pd.to_datetime(df[date_col], dayfirst=True, errors='coerce')
     
     df['time_of_day'] = 'Lunch'
     df.loc[df['order_timestamp'].dt.hour >= 16, 'time_of_day'] = 'Dinner'
@@ -160,10 +153,6 @@ def process_lightspeed(df):
         df['commission_ex_vat'] = 0.0
         return df[['order_id','source','channel','order_timestamp','time_of_day',
                    'vat_rate','net_sales','tax','gross_sales','commission_ex_vat']].reset_index(drop=True)
-
-def get_time_of_day_simple(hour):
-    if pd.isna(hour): return 'Unknown'
-    return 'Lunch' if hour < 16 else 'Dinner'
     
 def process_ubereats(df):
     first_row_vals = df.iloc[0].astype(str).str.strip().values
@@ -194,7 +183,7 @@ def process_ubereats(df):
         time_str = str(r.get('Order confirmed time', '')).strip()
         
         timestamp = pd.to_datetime(date_str + ' ' + time_str, dayfirst=True, errors='coerce')
-        time_of_day = get_time_of_day_simple(timestamp.hour if pd.notnull(timestamp) else None)
+        time_of_day = 'Lunch' if pd.notnull(timestamp) and timestamp.hour < 16 else ('Dinner' if pd.notnull(timestamp) else 'Unknown')
         
         date_suffix = timestamp.strftime('%Y%m%d') if pd.notnull(timestamp) else "Unknown"
         order_id = f"UE_{order_val}_{date_suffix}"
@@ -376,8 +365,9 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
     if new_df.empty:
         return 0, skipped
 
-    new_df['order_timestamp'] = new_df['order_timestamp'].astype(object).where(new_df['order_timestamp'].notna(), None)
-    new_df = new_df.replace({np.nan: None})
+    # Formatteer de tijden veilig naar strings zodat PostgreSQL niet crasht op lege datums
+    new_df['order_timestamp'] = new_df['order_timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+    new_df = new_df.replace({np.nan: None, 'NaT': None})
 
     records    = new_df.to_dict(orient="records")
     chunk_size = 500  
@@ -467,31 +457,24 @@ if st.sidebar.button("Process File(s)"):
 
         for i, file in enumerate(uploaded_files):
             try:
-                status_msg.info(f"⏳ Bestand {i+1}/{total_files}: Structuur controleren...")
-                header_bytes = file.read(2048)
-                first_line = header_bytes.decode('utf-8', errors='ignore').split('\n')[0]
+                status_msg.info(f"⏳ Bestand {i+1}/{total_files}: Structuur analyseren...")
+                raw = file.read()
+                
+                # Bepaal separator op basis van eerste regel
+                first_line = raw[:1024].decode('utf-8', errors='ignore').split('\n')[0]
                 detected_sep = ';' if first_line.count(';') > first_line.count(',') else ','
-                file.seek(0)
                 
-                # 🔥 ULTIEME OPLOSSING VOOR ENORME BESTANDEN: CHUNKS!
-                # Leest het gigantische bestand in veilige brokjes van 25.000 lijnen
-                status_msg.info(f"📥 Bestand {i+1}/{total_files}: Wordt in stukken gelezen (Anti-Crash)...")
+                status_msg.info(f"📥 Bestand {i+1}/{total_files}: Data inladen in het geheugen...")
+                df_raw = pd.read_csv(io.BytesIO(raw), sep=detected_sep, low_memory=False)
                 
-                chunk_iter = pd.read_csv(file, sep=detected_sep, low_memory=False, chunksize=25000)
+                status_msg.info(f"⚙️ Bestand {i+1}/{total_files}: Btw-tarieven en logica toepassen...")
+                clean_chunk = parsers[source_option](df_raw)
                 
-                file_clean_dfs = []
-                for chunk_num, chunk in enumerate(chunk_iter):
-                    status_msg.info(f"⚙️ Bestand {i+1}/{total_files}: Btw-tarieven berekenen voor blok {chunk_num+1}...")
-                    
-                    clean_chunk = parsers[source_option](chunk)
-                    if not clean_chunk.empty:
-                        file_clean_dfs.append(clean_chunk)
+                # Zwaar bestand direct weer uit RAM gooien
+                del df_raw
                 
-                if file_clean_dfs:
-                    final_file_df = pd.concat(file_clean_dfs, ignore_index=True)
-                    # Extra veiligheid: verwijder dubbels die toevallig over twee chunks heen vielen
-                    final_file_df = final_file_df.drop_duplicates(subset=['order_id', 'vat_rate'])
-                    all_clean_dfs.append(final_file_df)
+                if not clean_chunk.empty:
+                    all_clean_dfs.append(clean_chunk)
                     
             except Exception as e:
                 st.sidebar.error(f"Fout bij verwerken van {file.name}: {e}")
@@ -502,7 +485,6 @@ if st.sidebar.button("Process File(s)"):
         else:
             status_msg.info("🗄️ Alle bestanden verwerkt! Klaarmaken voor database import...")
             combined_df = pd.concat(all_clean_dfs, ignore_index=True)
-            # Dubbel check over alle gecombineerde bestanden heen
             combined_df = combined_df.drop_duplicates(subset=['order_id', 'vat_rate'])
             
             progress = st.sidebar.progress(0, text="Database controleren op dubbele orders...")
