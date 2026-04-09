@@ -38,11 +38,13 @@ def process_lightspeed(df):
         if 'Canceled' in df.columns:
             df = df[df['Canceled'].astype(str).str.strip().isin(['No', 'Nee', 'Non', 'False'])].copy()
         receipt_col, tax_col, tax_sep, rate_prefix = 'Identifier', 'TaxName', ':', 'BTW '        
+        vat_sep = '|' # Scheidingsteken voor K-Series BTW
     else:
         if 'Status' in df.columns:
             df = df[df['Status'].astype(str).str.strip().isin(['Paid', 'Done', 'Betaald', 'Afgerekend', 'Payé', 'Terminé', 'Voltooid'])].copy()
         receipt_col = 'Receipt ID' if 'Receipt ID' in df.columns else df.columns[0]
         tax_col, tax_sep, rate_prefix = 'Taxes', '=', ''
+        vat_sep = ',' # Scheidingsteken voor L-Series BTW
 
     if df.empty or receipt_col not in df.columns: return pd.DataFrame()
     df = df.dropna(subset=[receipt_col])
@@ -69,11 +71,20 @@ def process_lightspeed(df):
     if tax_col in df.columns and df[tax_col].astype(str).str.contains(tax_sep).any():
         base = df[['order_id','source','channel','order_timestamp','time_of_day', 'receipt_total', tax_col]].copy()
         vat_df = base.copy()
-        vat_df['vat_parts'] = vat_df[tax_col].astype(str).str.split('|')
+        
+        # Splits de BTW-kolom met de juiste separator voor de huidige versie
+        vat_df['vat_parts'] = vat_df[tax_col].astype(str).str.split(vat_sep)
         exploded = vat_df.explode('vat_parts')
+        
         exploded = exploded[exploded['vat_parts'].str.contains(tax_sep, na=False)].copy()
         split = exploded['vat_parts'].str.strip().str.split(tax_sep, expand=True)
-        exploded['rate'] = pd.to_numeric(split[0].str.replace(rate_prefix, '', regex=False).str.replace('%','').str.strip(), errors='coerce')
+        
+        # Haal het percentage eruit en vervang de prefix (alleen als er een prefix is!)
+        rate_str = split[0]
+        if rate_prefix:
+            rate_str = rate_str.str.replace(rate_prefix, '', regex=False)
+            
+        exploded['rate'] = pd.to_numeric(rate_str.str.replace('%', '', regex=False).str.strip(), errors='coerce')
         exploded['tax'] = pd.to_numeric(split[1].str.strip(), errors='coerce')
         
         exploded = exploded.dropna(subset=['rate','tax'])
