@@ -40,7 +40,8 @@ def get_time_of_day(hour):
     if pd.isna(hour): return 'Unknown'
     return 'Lunch' if hour < 16 else 'Dinner'
 
-def process_lightspeed(df, version="K-Series"):
+# ✅ FIX 2: Removed unused version parameter, relies 100% on auto-detect
+def process_lightspeed(df):
     df.columns = df.columns.astype(str).str.strip()
 
     is_kseries = 'Identifier' in df.columns
@@ -70,7 +71,17 @@ def process_lightspeed(df, version="K-Series"):
     gross_col = next((c for c in ['Total','Total incl. Tax'] if c in df.columns), None)
 
     df['order_id']        = f'LS_{version}_' + df[receipt_col].astype(str)
-    df['channel']         = df['Type'].apply(lambda x: 'Takeaway' if str(x).lower()=='takeaway' else 'In-Restaurant') if 'Type' in df.columns else 'In-Restaurant'
+    
+    # ✅ FIX 3: Correct channel detection for K-Series vs L-Series
+    if is_kseries:
+        df['channel'] = df['Mode'].apply(
+            lambda x: 'Takeaway' if str(x).lower() in ['takeout', 'takeaway', 'take-away'] else 'In-Restaurant'
+        ) if 'Mode' in df.columns else 'In-Restaurant'
+    else:
+        df['channel'] = df['Type'].apply(
+            lambda x: 'Takeaway' if str(x).lower() == 'takeaway' else 'In-Restaurant'
+        ) if 'Type' in df.columns else 'In-Restaurant'
+        
     df['order_timestamp'] = pd.to_datetime(df[date_col], dayfirst=True, errors='coerce')
     df['time_of_day']     = df['order_timestamp'].dt.hour.apply(get_time_of_day)
     df['source']          = f'Lightspeed {version}'
@@ -249,7 +260,6 @@ def process_deliveroo(df):
     df['channel'] = 'Delivery'
     df['source'] = 'Deliveroo'
 
-    # ✅ FIX: Deliveroo exports in YYYY-MM-DD, so no dayfirst=True here!
     df['order_timestamp'] = pd.to_datetime(
         df['Date submitted'].astype(str) + ' ' + df['Time submitted'].astype(str),
         errors='coerce'
@@ -298,6 +308,7 @@ def process_takeaway(df):
     df['tax'] = df['gross_sales'] - df['net_sales']
     df['vat_rate'] = '6%'
     
+    # Intentionally kept at 30% as per user request
     df['commission_ex_vat'] = (df['gross_sales'] * 0.30).round(2)
     
     return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales','commission_ex_vat']]
@@ -309,8 +320,16 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
     if progress_bar:
         progress_bar.progress(0.05, text="Checking database for existing records...")
 
+    # ✅ FIX 1: Restored WHERE clause to prevent full table downloads
+    sources = clean_df['source'].unique().tolist()
+    placeholders = ', '.join(f':s{i}' for i in range(len(sources)))
+    params = {f's{i}': s for i, s in enumerate(sources)}
+
     with engine.connect() as conn:
-        result = conn.execute(text("SELECT order_id, vat_rate FROM sales"))
+        result = conn.execute(
+            text(f"SELECT order_id, vat_rate FROM sales WHERE source IN ({placeholders})"),
+            params
+        )
         existing_df = pd.DataFrame(result.fetchall(), columns=['order_id', 'vat_rate'])
 
     if not existing_df.empty:
@@ -369,15 +388,18 @@ def load_data(full_history=False):
         
     df = pd.read_sql(query, engine)
     if not df.empty:
-        df['order_timestamp'] = pd.to_datetime(df['order_timestamp'])
-        df['order_date'] = df['order_timestamp'].dt.date
-        df['year'] = df['order_timestamp'].dt.year
-        df['month'] = df['order_timestamp'].dt.to_period('M').astype(str)
-        df['week_str'] = df['order_timestamp'].dt.strftime('%G-W%V')
-        df['quarter'] = df['order_timestamp'].dt.to_period('Q').astype(str)
+        df['order_timestamp'] = pd.to_datetime(df['order_timestamp'], errors='coerce')
+        df = df.dropna(subset=['order_timestamp']).copy()
         
-        if 'commission_ex_vat' in df.columns:
-            df['commission_ex_vat'] = pd.to_numeric(df['commission_ex_vat'], errors='coerce').fillna(0.0)
+        if not df.empty:
+            df['order_date'] = df['order_timestamp'].dt.date
+            df['year'] = df['order_timestamp'].dt.year
+            df['month'] = df['order_timestamp'].dt.to_period('M').astype(str)
+            df['week_str'] = df['order_timestamp'].dt.strftime('%G-W%V')
+            df['quarter'] = df['order_timestamp'].dt.to_period('Q').astype(str)
+            
+            if 'commission_ex_vat' in df.columns:
+                df['commission_ex_vat'] = pd.to_numeric(df['commission_ex_vat'], errors='coerce').fillna(0.0)
             
     return df
 
@@ -413,8 +435,8 @@ if st.sidebar.button("Process File(s)"):
                     df_raw = pd.read_csv(io.BytesIO(raw), sep=None, engine='python')
                     
                     parsers = {
-                        "Lightspeed K-Series": lambda d: process_lightspeed(d, "K-Series"),
-                        "Lightspeed L-Series": lambda d: process_lightspeed(d, "L-Series"),
+                        "Lightspeed K-Series": process_lightspeed,
+                        "Lightspeed L-Series": process_lightspeed,
                         "Uber Eats": process_ubereats,
                         "Deliveroo": process_deliveroo,
                         "Takeaway": process_takeaway,
@@ -459,6 +481,7 @@ if st.sidebar.button("🧹 Clean Database"):
     with st.spinner("Cleaning database thoroughly..."):
         try:
             with engine.begin() as conn:
+                # Still relevant because user uploaded K-series orders as L-series historically
                 result_fout = conn.execute(text("""
                     DELETE FROM sales 
                     WHERE source = 'Lightspeed L-Series' 
@@ -486,6 +509,8 @@ if st.sidebar.button("🧹 Clean Database"):
                 """))
                 count_after = conn.execute(text("SELECT COUNT(*) FROM sales")).scalar()
                 dubbels_verwijderd = count_before - count_after
+                
+                conn.execute(text("DELETE FROM sales WHERE order_timestamp IS NULL"))
                 
                 totaal_verwijderd = foute_verwijderd + dubbels_verwijderd
                 
@@ -559,60 +584,66 @@ with tab_vat:
     if vat_data.empty:
         st.info("No data in the report yet.")
     else:
-        quarters = sorted(vat_data['quarter'].unique(), reverse=True)
-        selected_q = st.selectbox("Select Quarter", quarters)
-        q_data = vat_data[vat_data['quarter'] == selected_q]
+        # ✅ FIX 9: Translating string to English
+        quarters_list = [str(q) for q in vat_data['quarter'].unique() if str(q) not in ['NaT', 'nan', 'None']]
+        quarters = sorted(quarters_list, reverse=True)
+        
+        if quarters:
+            selected_q = st.selectbox("Select Quarter", quarters)
+            q_data = vat_data[vat_data['quarter'] == selected_q]
 
-        if 'commission_ex_vat' in q_data.columns:
-            summary = q_data.groupby(['source','vat_rate'])[['net_sales','tax','gross_sales', 'commission_ex_vat']].sum().reset_index()
-            summary.columns = ['Source', 'VAT Rate', 'Net', 'VAT', 'Gross', 'Commission (ex VAT)']
-        else:
-            summary = q_data.groupby(['source','vat_rate'])[['net_sales','tax','gross_sales']].sum().reset_index()
-            summary.columns = ['Source', 'VAT Rate', 'Net', 'VAT', 'Gross']
-
-        totals_dict = {
-            'Source': 'TOTAL', 'VAT Rate': '',
-            'Net': summary['Net'].sum(),
-            'VAT': summary['VAT'].sum(),
-            'Gross': summary['Gross'].sum()
-        }
-        if 'Commission (ex VAT)' in summary.columns:
-            totals_dict['Commission (ex VAT)'] = summary['Commission (ex VAT)'].sum()
-            
-        totals = pd.DataFrame([totals_dict])
-        
-        st.subheader("Overview by Source")
-        
-        format_dict = {'Net': '€{:.2f}', 'VAT': '€{:.2f}', 'Gross': '€{:.2f}'}
-        if 'Commission (ex VAT)' in summary.columns:
-            format_dict['Commission (ex VAT)'] = '€{:.2f}'
-            
-        st.dataframe(
-            pd.concat([summary, totals], ignore_index=True)
-              .style.format(format_dict),
-            use_container_width=True
-        )
-        
-        with st.expander("Show all individual transactions (including Order ID)"):
-            cols_to_show = ['order_id', 'source', 'channel', 'order_timestamp', 'time_of_day', 'vat_rate', 'net_sales', 'tax', 'gross_sales']
             if 'commission_ex_vat' in q_data.columns:
-                cols_to_show.append('commission_ex_vat')
+                summary = q_data.groupby(['source','vat_rate'])[['net_sales','tax','gross_sales', 'commission_ex_vat']].sum().reset_index()
+                summary.columns = ['Source', 'VAT Rate', 'Net', 'VAT', 'Gross', 'Commission (ex VAT)']
+            else:
+                summary = q_data.groupby(['source','vat_rate'])[['net_sales','tax','gross_sales']].sum().reset_index()
+                summary.columns = ['Source', 'VAT Rate', 'Net', 'VAT', 'Gross']
+
+            totals_dict = {
+                'Source': 'TOTAL', 'VAT Rate': '',
+                'Net': summary['Net'].sum(),
+                'VAT': summary['VAT'].sum(),
+                'Gross': summary['Gross'].sum()
+            }
+            if 'Commission (ex VAT)' in summary.columns:
+                totals_dict['Commission (ex VAT)'] = summary['Commission (ex VAT)'].sum()
+                
+            totals = pd.DataFrame([totals_dict])
+            
+            st.subheader("Overview by Source")
+            
+            format_dict = {'Net': '€{:.2f}', 'VAT': '€{:.2f}', 'Gross': '€{:.2f}'}
+            if 'Commission (ex VAT)' in summary.columns:
+                format_dict['Commission (ex VAT)'] = '€{:.2f}'
+                
             st.dataframe(
-                q_data[cols_to_show],
+                pd.concat([summary, totals], ignore_index=True)
+                  .style.format(format_dict),
                 use_container_width=True
             )
-
-        if st.button("Export to Excel"):
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                summary.to_excel(writer, sheet_name='1. Summary', index=False)
-                
-                cols_to_export = ['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']
+            
+            with st.expander("Show all individual transactions (including Order ID)"):
+                cols_to_show = ['order_id', 'source', 'channel', 'order_timestamp', 'time_of_day', 'vat_rate', 'net_sales', 'tax', 'gross_sales']
                 if 'commission_ex_vat' in q_data.columns:
-                    cols_to_export.append('commission_ex_vat')
+                    cols_to_show.append('commission_ex_vat')
+                st.dataframe(
+                    q_data[cols_to_show],
+                    use_container_width=True
+                )
+
+            if st.button("Export to Excel"):
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    summary.to_excel(writer, sheet_name='1. Summary', index=False)
                     
-                q_data[cols_to_export].to_excel(writer, sheet_name='2. All_Transactions_Details', index=False)
-                    
-            st.download_button("📥 Download Excel File", output.getvalue(),
-                file_name=f"VAT_Report_{selected_q}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    cols_to_export = ['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']
+                    if 'commission_ex_vat' in q_data.columns:
+                        cols_to_export.append('commission_ex_vat')
+                        
+                    q_data[cols_to_export].to_excel(writer, sheet_name='2. All_Transactions_Details', index=False)
+                        
+                st.download_button("📥 Download Excel File", output.getvalue(),
+                    file_name=f"VAT_Report_{selected_q}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.info("No valid quarters found.")
