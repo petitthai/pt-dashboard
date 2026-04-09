@@ -45,21 +45,19 @@ def process_lightspeed(df, version="K-Series"):
     is_kseries = 'Identifier' in df.columns
 
     if is_kseries:
-        # K-series: filter by Type=SALE and Canceled=No
         if 'Type' in df.columns:
             df = df[df['Type'].astype(str).str.strip() == 'SALE'].copy()
         if 'Canceled' in df.columns:
             df = df[df['Canceled'].astype(str).str.strip() == 'No'].copy()
         receipt_col = 'Identifier'
-        tax_col     = 'TaxName'      # format: "BTW 12%:9.21|BTW 21%:2.78"
-        tax_sep     = ':'            # separator between rate label and amount
-        rate_prefix = 'BTW '        # prefix to strip to get numeric rate
+        tax_col     = 'TaxName'      
+        tax_sep     = ':'            
+        rate_prefix = 'BTW '        
     else:
-        # L-series: filter by Status
         if 'Status' in df.columns:
             df = df[df['Status'].astype(str).str.strip().isin(['Paid', 'Done'])].copy()
         receipt_col = 'Receipt ID' if 'Receipt ID' in df.columns else df.columns[0]
-        tax_col     = 'Taxes'        # format: "12%=1.5|21%=2.78"
+        tax_col     = 'Taxes'        
         tax_sep     = '='
         rate_prefix = ''
 
@@ -69,60 +67,42 @@ def process_lightspeed(df, version="K-Series"):
     )
 
     df['order_id']        = f'LS_{version}_' + df[receipt_col].astype(str)
+    df['channel']         = df['Type'].apply(lambda x: 'Takeaway' if str(x).lower()=='takeaway' else 'In-Restaurant') if 'Type' in df.columns else 'In-Restaurant'
     df['order_timestamp'] = pd.to_datetime(df[date_col], dayfirst=True)
     df['time_of_day']     = df['order_timestamp'].dt.hour.apply(get_time_of_day)
     df['source']          = f'Lightspeed {version}'
 
-    # Channel detection
-    if 'Type' in df.columns and not is_kseries:
-        df['channel'] = df['Type'].apply(
-            lambda x: 'Takeaway' if str(x).lower() == 'takeaway' else 'In-Restaurant'
-        )
-    elif 'Mode' in df.columns:
-        df['channel'] = df['Mode'].apply(
-            lambda x: 'Takeaway' if str(x).lower() in ['takeout', 'takeaway', 'take-away'] else 'In-Restaurant'
-        )
-    else:
-        df['channel'] = 'In-Restaurant'
-
-    # ── VAT parsing ──────────────────────────────────────────────────────────
-    has_tax = tax_col in df.columns
-    has_vat = has_tax and df[tax_col].astype(str).str.contains(tax_sep, na=False).any()
+    has_tax_col = 'Taxes' in df.columns
+    has_vat     = has_tax_col and df['Taxes'].astype(str).str.contains('=').any()
 
     if has_vat:
-        base = df[['order_id', 'source', 'channel', 'order_timestamp', 'time_of_day']].copy()
-        base['vat_parts'] = df[tax_col].astype(str).str.split('|')
+        base = df[['order_id','source','channel','order_timestamp','time_of_day']].copy()
+        base['vat_parts'] = df['Taxes'].astype(str).str.split('|')
         exploded = base.explode('vat_parts')
-        exploded = exploded[exploded['vat_parts'].str.contains(tax_sep, na=False)].copy()
+        exploded = exploded[exploded['vat_parts'].str.contains('=', na=False)].copy()
 
-        split = exploded['vat_parts'].str.strip().str.split(tax_sep, expand=True)
-
-        # Extract numeric rate — strip "BTW " prefix and "%" suffix
-        rate_str = split[0].str.replace(rate_prefix, '', regex=False).str.replace('%', '', regex=False).str.strip()
-        exploded['rate'] = pd.to_numeric(rate_str, errors='coerce')
-        exploded['tax']  = pd.to_numeric(split[1].str.strip(), errors='coerce')
-
-        exploded = exploded.dropna(subset=['rate', 'tax'])
-        exploded = exploded[(exploded['rate'] > 0) & (exploded['tax'] > 0)]
+        split = exploded['vat_parts'].str.strip().str.split('=', expand=True)
+        exploded['rate']     = pd.to_numeric(split[0].str.replace('%','').str.strip(), errors='coerce')
+        exploded['tax']      = pd.to_numeric(split[1].str.strip(), errors='coerce')
+        exploded = exploded.dropna(subset=['rate','tax'])
+        exploded = exploded[exploded['rate'] > 0]
 
         exploded['net_sales']   = (exploded['tax'] / (exploded['rate'] / 100)).round(2)
         exploded['gross_sales'] = (exploded['net_sales'] + exploded['tax']).round(2)
         exploded['vat_rate']    = exploded['rate'].astype(int).astype(str) + '%'
 
-        return exploded[['order_id', 'source', 'channel', 'order_timestamp', 'time_of_day',
-                          'vat_rate', 'net_sales', 'tax', 'gross_sales']].reset_index(drop=True)
-
+        return exploded[['order_id','source','channel','order_timestamp','time_of_day',
+                          'vat_rate','net_sales','tax','gross_sales']].reset_index(drop=True)
     else:
-        # Fallback: no VAT breakdown available, use totals
-        gross_col = next((c for c in ['Total', 'Total incl. Tax'] if c in df.columns), None)
-        net_col   = next((c for c in ['PreTax', 'Net Total', 'Total excl. Tax'] if c in df.columns), None)
+        gross_col = next((c for c in ['Total','Total incl. Tax'] if c in df.columns), None)
+        net_col   = next((c for c in ['Net Total','Total excl. Tax'] if c in df.columns), None)
         df['gross_sales'] = pd.to_numeric(df[gross_col], errors='coerce').fillna(0) if gross_col else 0.0
         df['net_sales']   = pd.to_numeric(df[net_col],   errors='coerce').fillna(0) if net_col else 0.0
         df['tax']         = df['gross_sales'] - df['net_sales']
         df['vat_rate']    = 'Mixed'
-        return df[['order_id', 'source', 'channel', 'order_timestamp', 'time_of_day',
-                   'vat_rate', 'net_sales', 'tax', 'gross_sales']].reset_index(drop=True)
-        
+        return df[['order_id','source','channel','order_timestamp','time_of_day',
+                   'vat_rate','net_sales','tax','gross_sales']].reset_index(drop=True)
+    
 def process_ubereats(df):
     first_row_vals = df.iloc[0].astype(str).str.strip().values
     if 'Order ID' in first_row_vals:
@@ -223,10 +203,8 @@ def process_deliveroo(df):
 
 def process_takeaway(df):
     df = df.copy()
-    # Aggressively strip quotes and spaces to fix the 'Order' KeyError
     df.columns = df.columns.astype(str).str.strip().str.replace('"', '').str.replace("'", "")
     
-    # Safely find columns ignoring case
     order_col = next((c for c in df.columns if 'order' in c.lower()), 'Order')
     pickup_col = next((c for c in df.columns if 'pickup' in c.lower()), 'Pickup')
     date_col = next((c for c in df.columns if 'date' in c.lower()), 'Date')
@@ -253,13 +231,11 @@ def process_takeaway(df):
     
     return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales']]
 
-# ✅ BLAZING FAST, VECTORIZED DB INSERT WITH PROGRESS TRACKING
 def save_to_db_with_progress(clean_df, progress_bar=None):
     if clean_df.empty:
         return 0, 0
 
-    # ── Step 1: fetch existing keys for this source ───────────────────────
-    sources      = clean_df['source'].unique().tolist()
+    sources = clean_df['source'].unique().tolist()
     placeholders = ', '.join(f':s{i}' for i in range(len(sources)))
 
     if progress_bar:
@@ -272,7 +248,6 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
         )
         existing_df = pd.DataFrame(result.fetchall(), columns=['order_id', 'vat_rate'])
 
-    # ── Step 2: vectorized dedup — no Python loop ─────────────────────────
     if not existing_df.empty:
         existing_keys = set(
             existing_df['order_id'].astype(str) + '||' + existing_df['vat_rate'].astype(str)
@@ -291,7 +266,6 @@ def save_to_db_with_progress(clean_df, progress_bar=None):
     if new_df.empty:
         return 0, skipped
 
-    # ── Step 3: insert in chunks ──────────────────────────────────────────
     records    = new_df.to_dict(orient="records")
     chunk_size = 500
     total      = len(records)
@@ -408,19 +382,28 @@ if st.sidebar.button("🧹 Clean Database"):
     try:
         with engine.begin() as conn:
             count_before = conn.execute(text("SELECT COUNT(*) FROM sales")).scalar()
+            
+            # ✅ SLIMME SCHOONMAAK: Kijkt door K-Series en L-Series fouten heen!
+            # Vervangt intern 'LS_K-Series_' en 'LS_L-Series_' door 'LS_' om de echte dubbels te vinden.
             conn.execute(text("""
                 DELETE FROM sales
                 WHERE id IN (
                     SELECT id FROM (
-                        SELECT id, ROW_NUMBER() OVER(PARTITION BY order_id, vat_rate ORDER BY id) as row_num
+                        SELECT id, ROW_NUMBER() OVER(
+                            PARTITION BY 
+                                REPLACE(REPLACE(order_id, 'LS_K-Series_', 'LS_'), 'LS_L-Series_', 'LS_'), 
+                                vat_rate 
+                            ORDER BY id
+                        ) as row_num
                         FROM sales
                     ) t WHERE t.row_num > 1
                 )
             """))
+            
             count_after = conn.execute(text("SELECT COUNT(*) FROM sales")).scalar()
             removed = count_before - count_after
             if removed > 0:
-                st.session_state['import_msg'] = f"✅ Cleaned! Removed {removed} duplicate rows."
+                st.session_state['import_msg'] = f"✅ Cleaned! Removed {removed} cross-source duplicate rows."
             else:
                 st.session_state['import_msg'] = "Database is already clean! No duplicates found."
             st.cache_data.clear()
@@ -501,16 +484,25 @@ with tab_vat:
             'Gross': summary['Gross'].sum()
         }])
         
+        st.subheader("Overzicht per bron")
         st.dataframe(
             pd.concat([summary, totals], ignore_index=True)
               .style.format({'Net': '€{:.2f}', 'VAT': '€{:.2f}', 'Gross': '€{:.2f}'}),
             use_container_width=True
         )
+        
+        # ✅ VAT EXPORT TOEVOEGING: Toon ook de losse transacties in de app
+        with st.expander("Toon alle individuele transacties (inclusief Order ID)"):
+            st.dataframe(
+                q_data[['order_id', 'source', 'channel', 'order_timestamp', 'time_of_day', 'vat_rate', 'net_sales', 'tax', 'gross_sales']],
+                use_container_width=True
+            )
 
         if st.button("Export to Excel"):
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 summary.to_excel(writer, sheet_name='Summary', index=False)
+                # De Excel export bevat ALTIJD al de order_id in het tweede tabblad!
                 q_data[['order_id','source','channel','order_timestamp',
                          'time_of_day','vat_rate','net_sales','tax','gross_sales']]\
                     .to_excel(writer, sheet_name='Transactions', index=False)
