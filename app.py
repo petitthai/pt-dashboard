@@ -262,7 +262,7 @@ msg_placeholder = st.sidebar.empty()
 if 'import_msg' in st.session_state: msg_placeholder.success(st.session_state.pop('import_msg'))
 
 with st.sidebar.expander("How to update?", expanded=True):
-    st.markdown("- **K-Series:** Reports → Receipts → Export CSV\n- **Uber Eats:** Payments → Invoices → CSV\n- **Deliveroo:** Invoices → Orders → CSV\n- **Takeaway:** Invoicing → Orders → CSV")
+    st.markdown("- **K-Series:** Reports → Receipts → Export CSV\n- **Uber Eats:** Reports → Payment Details → CSV\n- **Deliveroo:** Reports → Orders → CSV\n- **Takeaway:** Invoicing → Orders → CSV")
 
 src_opt = st.sidebar.selectbox("Source", ["Lightspeed K-Series","Lightspeed L-Series","Deliveroo","Uber Eats","Takeaway"])
 uploaded_files = st.sidebar.file_uploader("Upload CSV", type=["csv"], accept_multiple_files=True)
