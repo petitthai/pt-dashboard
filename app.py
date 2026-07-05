@@ -115,41 +115,105 @@ def process_lightspeed(df):
         return df[['order_id','source','channel','order_timestamp','time_of_day','vat_rate','net_sales','tax','gross_sales','commission_ex_vat']].reset_index(drop=True)
 
 def process_ubereats(df):
+    # Promote the short-code row to be the real header
     if 'Order ID' in df.iloc[0].astype(str).str.strip().values:
         df.columns = df.iloc[0].astype(str).str.strip().values
         df = df.iloc[1:].copy()
     df.columns = df.columns.astype(str).str.strip()
-    if 'Order status' not in df.columns: return pd.DataFrame()
-        
+
+    # --- Structure validation: fail loudly instead of silently defaulting to 0 ---
+    required_cols = [
+        'Order status',
+        'Order ID',
+        'Order date',
+        'Order confirmed time',
+        'VAT 1 on sales', 'VAT 2 on sales', 'VAT 3 on sales',
+        'VAT 1 on order error adjustments', 'VAT 2 on order error adjustments', 'VAT 3 on order error adjustments',
+        'VAT 1 on offers on items', 'VAT 2 on offers on items', 'VAT 3 on offers on items',
+        'Marketplace Fee after promotion (excl. VAT)',
+        'Cost of delivery (excl. VAT)',
+        'Order error adjustments (excl. VAT)',
+        'Offer Redemption Fee',
+        'Marketing adjustment (incl. VAT)',
+        'Total order (incl. VAT)',
+        'Sales (incl. VAT)',
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "Uber Eats file structure has changed — import aborted.\n"
+            f"Missing expected column(s): {', '.join(missing)}\n"
+            "No rows from this file were imported. Please check the export "
+            "format or update the column mapping in process_ubereats()."
+        )
+
     df = df[df['Order status'].astype(str).str.strip() == 'Completed'].copy()
-    rows, fee_cols = [], ['Marketplace fee after discount (excl. VAT)', 'Cost of delivery (excl. VAT)', 'Offers on items (excl. VAT)', 'Order error adjustments (excl. VAT)']
-    
+
+    def num(r, col):
+        v = pd.to_numeric(r.get(col, 0), errors='coerce')
+        return 0.0 if pd.isna(v) else float(v)
+
+    rate_pct = {'6%': 0.06, '12%': 0.12, '21%': 0.21}
+    rows = []
+
     for _, r in df.iterrows():
         order_val = str(r.get('Order ID') or r.iloc[0]).strip()
-        ts = pd.to_datetime(str(r.get('Order date', '')).strip() + ' ' + str(r.get('Order confirmed time', '')).strip(), dayfirst=True, errors='coerce')
+        ts = pd.to_datetime(
+            str(r.get('Order date', '')).strip() + ' ' + str(r.get('Order confirmed time', '')).strip(),
+            dayfirst=True, errors='coerce'
+        )
         tod = 'Lunch' if pd.notnull(ts) and ts.hour < 16 else ('Dinner' if pd.notnull(ts) else 'Unknown')
         oid = f"UE_{order_val}_{ts.strftime('%Y%m%d') if pd.notnull(ts) else 'Unknown'}"
-        
-        t_net, t_gross = pd.to_numeric(r.get('Sales (excl. VAT)', 0), errors='coerce'), pd.to_numeric(r.get('Sales (incl. VAT)', 0), errors='coerce')
-        v1, v2, v3 = pd.to_numeric(r.get('VAT 1 on sales', 0), errors='coerce'), pd.to_numeric(r.get('VAT 2 on sales', 0), errors='coerce'), pd.to_numeric(r.get('VAT 3 on sales', 0), errors='coerce')
-        v1, v2, v3 = 0 if pd.isna(v1) else v1, 0 if pd.isna(v2) else v2, 0 if pd.isna(v3) else v3
-        
-        t_comm = -sum([pd.to_numeric(r.get(fc, 0), errors='coerce') for fc in fee_cols if pd.notna(pd.to_numeric(r.get(fc, 0), errors='coerce'))])
-        base_row = {'order_id': oid, 'source': 'Uber Eats', 'channel': 'Delivery', 'order_timestamp': ts, 'time_of_day': tod}
-        
-        active = sum([v1 > 0, v2 > 0, v3 > 0])
-        if active == 1:
-            lbl, amt = ('6%', v1) if v1 > 0 else (('21%', v2) if v2 > 0 else ('12%', v3))
-            rows.append({**base_row, 'vat_rate': lbl, 'net_sales': t_net, 'tax': amt, 'gross_sales': t_gross, 'commission_ex_vat': round(t_comm, 2)})
-        elif active > 1:
-            for lbl, amt in [('6%', v1), ('21%', v2), ('12%', v3)]:
-                if amt > 0:
-                    n, g = round(amt / (float(lbl.replace('%', '')) / 100), 2), round(amt / (float(lbl.replace('%', '')) / 100) + amt, 2)
-                    rows.append({**base_row, 'vat_rate': lbl, 'net_sales': n, 'tax': amt, 'gross_sales': g, 'commission_ex_vat': round(t_comm * (g / t_gross if t_gross > 0 else 0), 2)})
-        else:
-            rows.append({**base_row, 'vat_rate': '0%', 'net_sales': t_net, 'tax': 0.0, 'gross_sales': t_gross, 'commission_ex_vat': round(t_comm, 2)})
-    return pd.DataFrame(rows)
+        base_row = {'order_id': oid, 'source': 'Uber Eats', 'channel': 'Delivery',
+                    'order_timestamp': ts, 'time_of_day': tod}
 
+        # Commission: fee columns are stored negative -> flip sign for a positive cost
+        fee_service = num(r, 'Marketplace Fee after promotion (excl. VAT)')
+        fee_delivery = num(r, 'Cost of delivery (excl. VAT)')
+        fee_error = num(r, 'Order error adjustments (excl. VAT)')
+        fee_redemp = num(r, 'Offer Redemption Fee')
+        adj_marketing = num(r, 'Marketing adjustment (incl. VAT)')
+
+        t_comm = abs(fee_service) + abs(fee_delivery) + abs(fee_error) + abs(fee_redemp)
+        t_comm -= abs(adj_marketing)
+
+        # Net VAT per rate = sales VAT + error-adjustment VAT + offer VAT
+        # (offers/adjustments are already negative in the CSV, so summing nets them out)
+        v1_total = num(r, 'VAT 1 on sales') + num(r, 'VAT 1 on order error adjustments') + num(r, 'VAT 1 on offers on items')
+        v2_total = num(r, 'VAT 2 on sales') + num(r, 'VAT 2 on order error adjustments') + num(r, 'VAT 2 on offers on items')
+        v3_total = num(r, 'VAT 3 on sales') + num(r, 'VAT 3 on order error adjustments') + num(r, 'VAT 3 on offers on items')
+
+        active = []
+        if abs(v1_total) > 0.001: active.append(('6%', abs(v1_total)))
+        if abs(v2_total) > 0.001: active.append(('12%', abs(v2_total)))
+        if abs(v3_total) > 0.001: active.append(('21%', abs(v3_total)))
+
+        if not active:
+            t_gross_total = num(r, 'Total order (incl. VAT)') or num(r, 'Sales (incl. VAT)')
+            rows.append({**base_row, 'vat_rate': '0%', 'net_sales': t_gross_total,
+                         'tax': 0.0, 'gross_sales': t_gross_total,
+                         'commission_ex_vat': round(t_comm, 2)})
+            continue
+
+        computed = []
+        gross_sum = 0.0
+        for lbl, vat_amt in active:
+            net_amt = round(vat_amt / rate_pct[lbl], 2)
+            gross_amt = round(net_amt + vat_amt, 2)
+            computed.append((lbl, net_amt, vat_amt, gross_amt))
+            gross_sum += gross_amt
+
+        for i, (lbl, net_amt, vat_amt, gross_amt) in enumerate(computed):
+            if len(computed) > 1 and gross_sum:
+                row_comm = round(t_comm * (gross_amt / gross_sum), 2)
+            else:
+                row_comm = round(t_comm, 2) if i == 0 else 0.0
+            rows.append({**base_row, 'vat_rate': lbl, 'net_sales': net_amt,
+                         'tax': round(vat_amt, 2), 'gross_sales': gross_amt,
+                         'commission_ex_vat': row_comm})
+
+    return pd.DataFrame(rows)
+    
 def process_deliveroo(df):
     df.columns = df.columns.astype(str).str.strip()
     if len(df.columns) == 1:
@@ -279,12 +343,15 @@ if st.sidebar.button("Process File(s)"):
                 raw = file.read()
                 f_line = raw[:1024].decode('utf-8', errors='ignore').split('\n')[0]
                 sep = ';' if f_line.count(';') > f_line.count(',') else ','
-                
+        
                 status_msg.info(f"⚙️ File {i+1}/{t_files}: Parsing data...")
                 df_raw = pd.read_csv(io.BytesIO(raw), sep=sep, low_memory=False)
                 clean_chunk = parsers[src_opt](df_raw)
                 del df_raw
-                if not clean_chunk.empty: all_clean_dfs.append(clean_chunk)
+                if not clean_chunk.empty:
+                    all_clean_dfs.append(clean_chunk)
+            except ValueError as e:
+                st.sidebar.error(f"❌ {file.name}: {e}")
             except Exception as e:
                 st.sidebar.error(f"Error {file.name}: {e}")
 
