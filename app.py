@@ -56,7 +56,12 @@ def process_lightspeed(df):
     df['order_id'] = f'LS_{version}_' + df[receipt_col].astype(str)
     
     if is_kseries:
-        df['channel'] = df.get('Mode', pd.Series(dtype=str)).apply(lambda x: 'Takeaway' if str(x).lower().strip() in ['takeout', 'takeaway', 'take-away', 'afhaal', 'emporter'] else 'In-Restaurant')
+        profile_col = df.get('Profile', pd.Series(dtype=str, index=df.index))
+        df['channel'] = profile_col.apply(
+            lambda x: 'Takeaway' if str(x).strip().lower() in
+            ['takeout', 'takeaway', 'take-away', 'take away', 'oa take-away', 'afhaal', 'emporter']
+            else 'In-Restaurant'
+        )
     else:
         df['channel'] = df.get('Type', pd.Series(dtype=str)).apply(lambda x: 'Takeaway' if str(x).lower().strip() in ['takeaway', 'afhaal', 'emporter'] else 'In-Restaurant')
             
